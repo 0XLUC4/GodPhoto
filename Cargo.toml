@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+godphoto-core = { path = "crates/core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "tga", "ico", "qoi", "pnm", "hdr", "exr", "rayon"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Pixel work is slow unoptimized; optimize deps and the core even in dev.
+[profile.dev.package."*"]
+opt-level = 2

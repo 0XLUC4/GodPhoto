@@ -1,0 +1,47 @@
+//! GodPhoto: desktop entry point.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod app;
+mod branding;
+mod canvas;
+mod dialogs;
+mod doc;
+mod panels;
+mod platform;
+mod theme;
+mod toasts;
+mod tools;
+mod updates;
+mod widgets;
+mod window;
+
+pub const APP_NAME: &str = "GodPhoto";
+
+fn main() -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_NAME)
+        .with_app_id("godphoto")
+        .with_inner_size([1360.0, 880.0])
+        .with_min_inner_size([860.0, 540.0])
+        .with_drag_and_drop(true);
+    if let Some(icon) = branding::icon_data() {
+        viewport = viewport.with_icon(icon);
+    }
+    let files = std::env::args_os().skip(1).map(Into::into).collect();
+    let remembered = window::load(egui::vec2(860.0, 540.0));
+    if let Some(size) = remembered.size {
+        viewport = viewport.with_inner_size(size);
+    }
+    viewport = viewport.with_maximized(remembered.maximized);
+    let options = eframe::NativeOptions {
+        viewport,
+        // Kept by `window`, which never brings back the size of a minimized window.
+        persist_window: false,
+        ..Default::default()
+    };
+    eframe::run_native(
+        APP_NAME,
+        options,
+        Box::new(|cc| Ok(Box::new(app::GodApp::new(cc, files)))),
+    )
+}
