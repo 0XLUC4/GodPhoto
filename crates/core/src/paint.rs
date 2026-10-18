@@ -36,6 +36,55 @@ pub struct Brush {
     pub wet_edges: bool,
     /// Dabs keep adding up past the opacity (airbrush).
     pub build_up: bool,
+    /// A shape of its own instead of a round tip: 255 paints fully.
+    #[serde(default)]
+    pub tip: Option<Tip>,
+}
+
+/// A brush tip made from a picture (Edit › Define Brush Preset).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tip {
+    pub width: u32,
+    pub height: u32,
+    pub coverage: Vec<u8>,
+}
+
+impl Tip {
+    /// The tip from a picture: dark and opaque paints, light or clear does not.
+    pub fn from_image(image: &RgbaImage) -> Tip {
+        let coverage = image
+            .pixels()
+            .map(|p| {
+                let dark = 255 - crate::luma(p[0], p[1], p[2]);
+                crate::mul(dark, p[3])
+            })
+            .collect();
+        Tip {
+            width: image.width(),
+            height: image.height(),
+            coverage,
+        }
+    }
+
+    /// Coverage at (u, v), both -1..=1 across the tip, bilinear.
+    fn at(&self, u: f32, v: f32) -> f32 {
+        let (w, h) = (self.width as f32, self.height as f32);
+        let x = (u + 1.0) / 2.0 * w - 0.5;
+        let y = (v + 1.0) / 2.0 * h - 0.5;
+        let get = |x: i64, y: i64| {
+            if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
+                0.0
+            } else {
+                self.coverage[(y as u32 * self.width + x as u32) as usize] as f32 / 255.0
+            }
+        };
+        let (fx, fy) = (x.floor(), y.floor());
+        let (tx, ty) = (x - fx, y - fy);
+        let (ix, iy) = (fx as i64, fy as i64);
+        let top = get(ix, iy) * (1.0 - tx) + get(ix + 1, iy) * tx;
+        let bottom = get(ix, iy + 1) * (1.0 - tx) + get(ix + 1, iy + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
 }
 
 impl Default for Brush {
@@ -54,8 +103,87 @@ impl Default for Brush {
             smoothing: 0.0,
             wet_edges: false,
             build_up: false,
+            tip: None,
         }
     }
+}
+
+/// Ready-made brushes: name and settings.
+pub fn brush_presets() -> Vec<(&'static str, Brush)> {
+    let base = Brush::default();
+    vec![
+        (
+            "Hard Round",
+            Brush {
+                hardness: 1.0,
+                ..base.clone()
+            },
+        ),
+        (
+            "Soft Round",
+            Brush {
+                hardness: 0.0,
+                ..base.clone()
+            },
+        ),
+        (
+            "Airbrush",
+            Brush {
+                hardness: 0.0,
+                flow: 0.1,
+                build_up: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "Chalk",
+            Brush {
+                hardness: 0.6,
+                scatter: 0.4,
+                jitter_size: 0.5,
+                spacing: 0.15,
+                ..base.clone()
+            },
+        ),
+        (
+            "Calligraphy",
+            Brush {
+                hardness: 1.0,
+                roundness: 0.2,
+                angle: 45.0,
+                spacing: 0.05,
+                ..base.clone()
+            },
+        ),
+        (
+            "Spatter",
+            Brush {
+                hardness: 0.9,
+                scatter: 2.0,
+                jitter_size: 0.9,
+                spacing: 0.5,
+                ..base.clone()
+            },
+        ),
+        (
+            "Watercolor",
+            Brush {
+                hardness: 0.3,
+                flow: 0.4,
+                wet_edges: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "Smooth Ink",
+            Brush {
+                hardness: 0.95,
+                smoothing: 0.6,
+                spacing: 0.05,
+                ..base
+            },
+        ),
+    ]
 }
 
 /// How a gradient spreads from `start` to `end`.
@@ -773,6 +901,11 @@ fn make_dab(
                 continue;
             }
             let d = distance / radius;
+            if let Some(tip) = &brush.tip {
+                // The tip picture fills the dab's square, turned and squeezed like it.
+                weights.push(tip.at(rx / radius, ry / roundness / radius));
+                continue;
+            }
             let soft = if d <= hardness {
                 1.0
             } else if d >= 1.0 {
@@ -1429,7 +1562,13 @@ pub fn shape_path(shape: &Shape, from: (f32, f32), to: (f32, f32)) -> Vec<(f32, 
 }
 
 /// Coverage of a polyline `width` wide (round joins and caps).
-fn stroke_coverage(w: u32, h: u32, points: &[(f32, f32)], closed: bool, width: f32) -> GrayImage {
+pub(crate) fn stroke_coverage(
+    w: u32,
+    h: u32,
+    points: &[(f32, f32)],
+    closed: bool,
+    width: f32,
+) -> GrayImage {
     let mut mask = GrayImage::new(w, h);
     if points.is_empty() || w == 0 || h == 0 || width <= 0.0 {
         return mask;
@@ -1474,7 +1613,7 @@ fn stroke_coverage(w: u32, h: u32, points: &[(f32, f32)], closed: bool, width: f
     mask
 }
 
-fn paint_coverage(image: &mut RgbaImage, coverage: &GrayImage, color: [u8; 4]) {
+pub(crate) fn paint_coverage(image: &mut RgbaImage, coverage: &GrayImage, color: [u8; 4]) {
     let alpha = color[3] as f32 / 255.0;
     paint_where(image, Blend::Normal, |x, y| {
         let c = coverage.get_pixel(x, y)[0];

@@ -240,6 +240,28 @@ pub enum Dialog {
     Effect {
         effect: Effect,
     },
+    /// Settings of a filter kept on a smart object, shown live.
+    SmartFilter {
+        layer: usize,
+        number: usize,
+        filter: Filter,
+        before: Filter,
+    },
+    /// Indexed colours or black and white: how many colours, dithered or not.
+    Mode {
+        mode: godphoto_core::ColorMode,
+        colors: usize,
+        dither: bool,
+    },
+    /// Assign or convert to a colour profile.
+    Profile {
+        convert: bool,
+        /// Index among the built-in profiles.
+        choice: usize,
+        /// A profile read from a file, used instead of `choice`.
+        loaded: Option<godphoto_core::color::Profile>,
+        bpc: bool,
+    },
     Preferences,
     About,
 }
@@ -1085,6 +1107,157 @@ impl GodApp {
                         self.end_preview();
                         false
                     }
+                    None => true,
+                }
+            }
+            Dialog::SmartFilter {
+                layer,
+                number,
+                filter,
+                before,
+            } => {
+                ui.heading(filter.name());
+                ui.add_space(6.0);
+                let changed = params_ui(ui, filter.params());
+                let (layer, number) = (*layer, *number);
+                let tab = &mut self.tabs[self.active];
+                let set = |tab: &mut DocTab, value: &Filter| {
+                    if let Some(Content::Smart(smart)) =
+                        tab.doc.layers.get_mut(layer).map(|l| &mut l.content)
+                        && let Some(slot) = smart.filters.get_mut(number)
+                    {
+                        slot.filter = value.clone();
+                        smart.touch();
+                        tab.recomposite();
+                    }
+                };
+                if changed {
+                    set(tab, filter);
+                }
+                match buttons(ui, "OK") {
+                    Some(Answer::Ok) => {
+                        set(tab, filter);
+                        tab.commit("Smart Filter");
+                        false
+                    }
+                    Some(Answer::Cancel) => {
+                        set(tab, before);
+                        false
+                    }
+                    None => true,
+                }
+            }
+            Dialog::Mode {
+                mode,
+                colors,
+                dither,
+            } => {
+                ui.heading(mode.name());
+                ui.add_space(6.0);
+                if *mode == godphoto_core::ColorMode::Indexed {
+                    ui.add(egui::Slider::new(colors, 2..=256).text("Colors"));
+                }
+                ui.checkbox(dither, "Dither");
+                ui.label(RichText::new("The image is flattened.").weak());
+                let (mode, colors, dither) = (*mode, *colors, *dither);
+                answer_with(buttons(ui, "OK"), || {
+                    clicked.push(Cmd::SetMode {
+                        mode,
+                        colors,
+                        dither,
+                        flatten: true,
+                    })
+                })
+            }
+            Dialog::Profile {
+                convert,
+                choice,
+                loaded,
+                bpc,
+            } => {
+                use godphoto_core::color;
+                ui.heading(if *convert {
+                    "Convert to profile"
+                } else {
+                    "Assign profile"
+                });
+                ui.add_space(6.0);
+                let tab = &self.tabs[self.active];
+                let now = color::Profile::of(tab.doc.profile.as_deref());
+                ui.label(format!("Now: {}", now.name()));
+                let profiles: Vec<(&str, color::Profile)> = color::built_in()
+                    .into_iter()
+                    .filter(|(_, p)| !p.is_cmyk())
+                    .collect();
+                let shown = loaded.as_ref().map(|p| p.name()).unwrap_or_else(|| {
+                    profiles
+                        .get(*choice)
+                        .map_or(String::new(), |p| p.0.to_owned())
+                });
+                egui::ComboBox::from_label("Profile")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for (index, (name, _)) in profiles.iter().enumerate() {
+                            if ui
+                                .selectable_label(loaded.is_none() && *choice == index, *name)
+                                .clicked()
+                            {
+                                *choice = index;
+                                *loaded = None;
+                            }
+                        }
+                    });
+                if ui.button("Load an ICC profile…").clicked()
+                    && let Some(path) = crate::platform::pick_file("ICC profile", &["icc", "icm"])
+                {
+                    match std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|b| color::Profile::from_icc(&b).map_err(|e| e.to_string()))
+                    {
+                        Ok(profile) => *loaded = Some(profile),
+                        Err(err) => self
+                            .toasts
+                            .error(format!("Cannot read {}: {err}", path.display())),
+                    }
+                }
+                if *convert {
+                    egui::ComboBox::from_label("Intent")
+                        .selected_text(format!("{:?}", self.intent))
+                        .show_ui(ui, |ui| {
+                            for intent in [
+                                color::Intent::Perceptual,
+                                color::Intent::Relative,
+                                color::Intent::Saturation,
+                                color::Intent::Absolute,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.intent,
+                                    intent,
+                                    format!("{intent:?}"),
+                                );
+                            }
+                        });
+                    ui.checkbox(bpc, "Black point compensation");
+                }
+                match buttons(ui, "OK") {
+                    Some(Answer::Ok) => {
+                        let target = loaded
+                            .clone()
+                            .or_else(|| profiles.get(*choice).map(|p| p.1.clone()));
+                        if let Some(target) = target {
+                            let (intent, bpc, convert) = (self.intent, *bpc, *convert);
+                            let tab = &mut self.tabs[self.active];
+                            if convert {
+                                color::convert_profile(&mut tab.doc, &target, intent, bpc);
+                                tab.commit("Convert to Profile");
+                            } else {
+                                color::assign_profile(&mut tab.doc, Some(&target));
+                                tab.commit("Assign Profile");
+                            }
+                        }
+                        false
+                    }
+                    Some(Answer::Cancel) => false,
                     None => true,
                 }
             }

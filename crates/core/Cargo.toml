@@ -6,10 +6,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-image.workspace = true
+# AVIF encoding through ravif (rav1e, pure Rust).
+image = { workspace = true, features = ["avif"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ab_glyph = "0.2"
+# Pure-Rust ICC colour management (also used inside `image`).
+moxcms = "0.8"
 # Deflate through miniz_oxide: no C code.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# CMYK TIFF and CMYK JPEG writing.
+tiff = "0.11"
+jpeg-encoder = "0.7"
+# Gzip layer chunks of PDN files.
+flate2 = "1"
+# SVG parsing (usvg, re-exported) and rendering.
+resvg = "0.48"

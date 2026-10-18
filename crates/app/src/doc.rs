@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
-use godphoto_core::{Content, Document, GrayImage, Layer, RgbaImage, select, transform};
+use godphoto_core::{Content, Document, GrayImage, Layer, RgbaImage, color, select, transform};
 
 /// Pixels the undo steps may hold, all together.
 const HISTORY_BUDGET: usize = 2_000_000_000;
@@ -56,6 +56,10 @@ pub struct DocTab {
     pub doc: Document,
     /// Index of the layer being worked on.
     pub active: usize,
+    /// Every selected layer (Ctrl or Shift + click), the active one among them.
+    pub picked: Vec<usize>,
+    /// Paths of the Paths panel: (name, sub-paths); the work path is the pen's own.
+    pub paths: Vec<(String, Vec<godphoto_core::vector::SubPath>)>,
     pub selection: Option<GrayImage>,
     /// Brought back by Reselect.
     pub last_selection: Option<GrayImage>,
@@ -76,10 +80,25 @@ pub struct DocTab {
     /// While painting: the layers drawn once, so parts of them can be composited fast.
     rendered: Option<Vec<Option<RgbaImage>>>,
     /// Layer left out of the composite (shown apart while it moves or transforms).
-    pub hidden: Option<usize>,
+    pub hidden: Vec<usize>,
     pub notes: Vec<Note>,
     pub counts: Vec<egui::Pos2>,
     pub samplers: Vec<egui::Pos2>,
+    /// Edits the document of a smart object: (tab, layer) it belongs to.
+    pub smart_parent: Option<(u64, usize)>,
+    /// History position last brought into the smart object.
+    pub synced: (usize, usize),
+    /// How the screen shows the colours: proof target and intent, gamut warning.
+    color_view: Option<ColorView>,
+}
+
+/// Proofing on screen.
+#[derive(Clone)]
+pub struct ColorView {
+    /// Kept to know when it changes.
+    pub key: (usize, u8, bool, bool),
+    pub proof: Option<(color::Profile, color::Intent)>,
+    pub gamut: Option<color::Profile>,
 }
 
 impl DocTab {
@@ -91,6 +110,8 @@ impl DocTab {
             path,
             dirty: false,
             active: doc.layers.len().saturating_sub(1),
+            picked: Vec::new(),
+            paths: Vec::new(),
             doc,
             selection: None,
             last_selection: None,
@@ -109,10 +130,13 @@ impl DocTab {
             display_scale: 1.0,
             ants: None,
             rendered: None,
-            hidden: None,
+            hidden: Vec::new(),
             notes: Vec::new(),
             counts: Vec::new(),
             samplers: Vec::new(),
+            smart_parent: None,
+            synced: (0, 0),
+            color_view: None,
         };
         let step = tab.snapshot(opened, None);
         tab.history.push(step);
@@ -256,6 +280,12 @@ impl DocTab {
             ));
         }
         self.active = self.active.min(self.doc.layers.len() - 1);
+        // A group's end marker is never the active layer: its header is.
+        if matches!(self.doc.layers[self.active].content, Content::GroupEnd) {
+            self.active = self.doc.group_header(self.active).unwrap_or(0);
+        }
+        let count = self.doc.layers.len();
+        self.picked.retain(|index| *index < count);
         if let Some(selection) = &self.selection {
             let fits = selection.dimensions() == self.size();
             if !fits || select::is_empty(selection) {
@@ -317,7 +347,7 @@ impl DocTab {
                 .mask
                 .as_ref()
                 .map(|mask| transform::crop_gray(mask, x, y, w, h));
-            piece.visible = layer.visible && self.hidden != Some(index);
+            piece.visible = layer.visible && !self.hidden.contains(&index);
             part.layers.push(piece);
         }
         let piece = part.composite();
@@ -328,7 +358,17 @@ impl DocTab {
     /// Make the composite and its texture match the document. Call once a frame.
     pub fn texture(&mut self, ctx: &Context) -> TextureHandle {
         if self.stale {
-            self.composite = self.doc.composite_with(self.hidden);
+            self.composite = if self.hidden.is_empty() {
+                self.doc.composite()
+            } else {
+                let mut shown = self.doc.clone();
+                for index in &self.hidden {
+                    if let Some(layer) = shown.layers.get_mut(*index) {
+                        layer.visible = false;
+                    }
+                }
+                shown.composite()
+            };
             self.stale = false;
             self.texture = None;
         }
@@ -340,41 +380,78 @@ impl DocTab {
             minification: egui::TextureFilter::Linear,
             ..Default::default()
         };
+        let changed = std::mem::take(&mut self.changed);
+        let mut slot = self.texture.take();
+        let plain = self.color_view.is_none() && self.doc.profile.is_none();
         let shown = |image: &RgbaImage| {
+            let image = if plain {
+                image.clone()
+            } else {
+                self.on_screen(image)
+            };
             let image = if scale < 1.0 {
                 let (w, h) = (
                     (width as f32 * scale) as u32,
                     (height as f32 * scale) as u32,
                 );
-                image::imageops::resize(image, w.max(1), h.max(1), image::imageops::Triangle)
+                image::imageops::resize(&image, w.max(1), h.max(1), image::imageops::Triangle)
             } else {
-                image.clone()
+                image
             };
             let size = [image.width() as usize, image.height() as usize];
             ColorImage::from_rgba_unmultiplied(size, image.as_raw())
         };
-        match &mut self.texture {
+        match &mut slot {
             Some(texture) if scale >= 1.0 => {
-                for (x, y, w, h) in self.changed.drain(..) {
+                for (x, y, w, h) in changed {
                     let piece = transform::crop(&self.composite, x, y, w, h);
+                    let piece = if plain { piece } else { self.on_screen(&piece) };
                     let size = [w as usize, h as usize];
                     let color = ColorImage::from_rgba_unmultiplied(size, piece.as_raw());
                     texture.set_partial([x as usize, y as usize], color, options);
                 }
             }
-            Some(texture) if !self.changed.is_empty() => {
-                self.changed.clear();
+            Some(texture) if !changed.is_empty() => {
                 texture.set(shown(&self.composite), options);
             }
             Some(_) => {}
             None => {
-                self.changed.clear();
                 let name = format!("doc-{}", self.id);
-                self.texture = Some(ctx.load_texture(name, shown(&self.composite), options));
+                slot = Some(ctx.load_texture(name, shown(&self.composite), options));
             }
         }
+        self.texture = slot;
         self.display_scale = scale;
         self.texture.clone().expect("made above")
+    }
+
+    /// Proof colours or warn of the gamut on screen (`None`: as they are).
+    pub fn set_view(&mut self, view: Option<ColorView>) {
+        let key = |v: &Option<ColorView>| v.as_ref().map(|v| v.key);
+        if key(&self.color_view) != key(&view) {
+            self.color_view = view;
+            self.texture = None;
+        }
+    }
+
+    /// What the screen shows of `image`: through the document's profile, the proof and
+    /// the gamut warning.
+    fn on_screen(&self, image: &RgbaImage) -> RgbaImage {
+        let profile = color::Profile::of(self.doc.profile.as_deref());
+        let mut shown = match self.color_view.as_ref().and_then(|v| v.proof.as_ref()) {
+            Some((target, intent)) => color::proof(image, &profile, target, *intent),
+            None if profile.is_srgb() => image.clone(),
+            None => color::to_display(image, &profile),
+        };
+        if let Some(target) = self.color_view.as_ref().and_then(|v| v.gamut.as_ref()) {
+            let warning = color::gamut_warning(image, &profile, target);
+            for (pixel, flag) in shown.pixels_mut().zip(warning.pixels()) {
+                if flag[0] > 0 {
+                    *pixel = image::Rgba([128, 128, 128, 255]);
+                }
+            }
+        }
+        shown
     }
 
     /// Show the composite again from scratch (after a layer was hidden or shown apart).
@@ -416,5 +493,7 @@ fn layer_settings(layer: &Layer) -> Layer {
         mask: None,
         mask_on: layer.mask_on,
         effects: layer.effects.clone(),
+        label: 0,
+        link: 0,
     }
 }

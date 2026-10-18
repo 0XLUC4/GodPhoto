@@ -9,6 +9,15 @@ use crate::widgets::icon;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tool {
     Move,
+    Artboard,
+    Slice,
+    SliceSelect,
+    PathSelection,
+    DirectSelection,
+    AddAnchor,
+    DeleteAnchor,
+    ConvertPoint,
+    CurvaturePen,
     RectMarquee,
     EllipseMarquee,
     RowMarquee,
@@ -69,7 +78,7 @@ pub enum Tool {
 
 /// The toolbar: groups of tools that share a button, with the key that picks them.
 pub const GROUPS: &[(char, &[Tool])] = &[
-    ('V', &[Tool::Move]),
+    ('V', &[Tool::Move, Tool::Artboard]),
     (
         'M',
         &[
@@ -84,7 +93,15 @@ pub const GROUPS: &[(char, &[Tool])] = &[
         'W',
         &[Tool::ObjectSelect, Tool::QuickSelect, Tool::MagicWand],
     ),
-    ('C', &[Tool::Crop, Tool::PerspectiveCrop]),
+    (
+        'C',
+        &[
+            Tool::Crop,
+            Tool::PerspectiveCrop,
+            Tool::Slice,
+            Tool::SliceSelect,
+        ],
+    ),
     (
         'I',
         &[
@@ -124,7 +141,18 @@ pub const GROUPS: &[(char, &[Tool])] = &[
     ('G', &[Tool::Gradient, Tool::Bucket]),
     ('R', &[Tool::Blur, Tool::Sharpen, Tool::Smudge]),
     ('O', &[Tool::Dodge, Tool::Burn, Tool::Sponge]),
-    ('P', &[Tool::Pen, Tool::FreeformPen]),
+    (
+        'P',
+        &[
+            Tool::Pen,
+            Tool::FreeformPen,
+            Tool::CurvaturePen,
+            Tool::AddAnchor,
+            Tool::DeleteAnchor,
+            Tool::ConvertPoint,
+        ],
+    ),
+    ('A', &[Tool::PathSelection, Tool::DirectSelection]),
     (
         'T',
         &[
@@ -153,6 +181,15 @@ impl Tool {
     pub fn name(self) -> &'static str {
         match self {
             Self::Move => "Move",
+            Self::Artboard => "Artboard",
+            Self::Slice => "Slice",
+            Self::SliceSelect => "Slice Select",
+            Self::PathSelection => "Path Selection",
+            Self::DirectSelection => "Direct Selection",
+            Self::AddAnchor => "Add Anchor Point",
+            Self::DeleteAnchor => "Delete Anchor Point",
+            Self::ConvertPoint => "Convert Point",
+            Self::CurvaturePen => "Curvature Pen",
             Self::RectMarquee => "Rectangular Marquee",
             Self::EllipseMarquee => "Elliptical Marquee",
             Self::RowMarquee => "Single Row Marquee",
@@ -215,6 +252,15 @@ impl Tool {
     pub fn glyph(self) -> &'static str {
         match self {
             Self::Move => icon::ARROWS_OUT_CARDINAL,
+            Self::Artboard => icon::FRAME_CORNERS,
+            Self::Slice => icon::KNIFE,
+            Self::SliceSelect => icon::CURSOR_CLICK,
+            Self::PathSelection => icon::NAVIGATION_ARROW,
+            Self::DirectSelection => icon::CURSOR,
+            Self::AddAnchor => icon::PLUS_CIRCLE,
+            Self::DeleteAnchor => icon::MINUS_CIRCLE,
+            Self::ConvertPoint => icon::ANGLE,
+            Self::CurvaturePen => icon::BEZIER_CURVE,
             Self::RectMarquee => icon::SELECTION,
             Self::EllipseMarquee => icon::CIRCLE_DASHED,
             Self::RowMarquee => icon::ARROWS_HORIZONTAL,
@@ -365,6 +411,14 @@ pub struct Options {
     pub align: godphoto_core::text::Align,
     pub crop_ratio: Option<(f32, f32)>,
     pub zoom_out: bool,
+    /// Dash pattern of shape strokes, in stroke widths; empty for solid.
+    pub dash: Vec<f32>,
+    pub stroke_align: godphoto_core::vector::StrokeAlign,
+    /// Pen pressure changes the brush size and opacity.
+    pub pressure_size: bool,
+    pub pressure_opacity: bool,
+    /// Brushes defined by the user (Edit › Define Brush Preset).
+    pub brushes: Vec<(String, Brush)>,
     pub aligned: bool,
 }
 
@@ -402,12 +456,18 @@ impl Default for Options {
             align: godphoto_core::text::Align::Left,
             crop_ratio: None,
             zoom_out: false,
+            dash: Vec::new(),
+            stroke_align: godphoto_core::vector::StrokeAlign::Center,
+            pressure_size: true,
+            pressure_opacity: false,
+            brushes: Vec::new(),
             aligned: true,
         }
     }
 }
 
 /// What the options bar asks the app to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Request {
     /// Turn the pen path into a selection.
     PathToSelection,
@@ -415,6 +475,7 @@ pub enum Request {
     StrokePath,
     ShapeFromPath,
     ClearPath,
+    SavePath,
     /// Straighten the layer along the ruler's line.
     Straighten,
     CommitCrop,
@@ -517,13 +578,21 @@ pub fn options_bar(
                 }
             }
             Tool::Gradient => gradient_settings(ui, options),
-            Tool::Pen | Tool::FreeformPen => {
+            Tool::Pen
+            | Tool::FreeformPen
+            | Tool::CurvaturePen
+            | Tool::AddAnchor
+            | Tool::DeleteAnchor
+            | Tool::ConvertPoint
+            | Tool::PathSelection
+            | Tool::DirectSelection => {
                 for (label, request) in [
                     ("Selection", Request::PathToSelection),
                     ("Fill", Request::FillPath),
                     ("Stroke", Request::StrokePath),
                     ("Shape", Request::ShapeFromPath),
                     ("Clear", Request::ClearPath),
+                    ("Save to Paths", Request::SavePath),
                 ] {
                     if ui.button(label).clicked() {
                         requests.push(request);
@@ -573,6 +642,31 @@ fn select_modes(ui: &mut Ui, mode: &mut select::Mode) {
 }
 
 fn brush_settings(ui: &mut Ui, tool: Tool, options: &mut Options) {
+    let presets = godphoto_core::paint::brush_presets();
+    egui::ComboBox::from_id_salt("brush-preset")
+        .selected_text(if options.brush.tip.is_some() {
+            "Custom tip"
+        } else {
+            "Brush preset"
+        })
+        .show_ui(ui, |ui| {
+            let mine: Vec<(String, Brush)> = options.brushes.clone();
+            let all = presets
+                .into_iter()
+                .map(|(name, brush)| (name.to_owned(), brush))
+                .chain(mine);
+            for (name, brush) in all {
+                if ui.button(name).clicked() {
+                    // The size stays what it is unless the preset has a tip of its own.
+                    let size = if brush.tip.is_some() {
+                        brush.size
+                    } else {
+                        options.brush.size
+                    };
+                    options.brush = Brush { size, ..brush };
+                }
+            }
+        });
     let brush = &mut options.brush;
     slider(ui, "Size", &mut brush.size, 1.0..=1000.0, " px");
     if !matches!(tool, Tool::Pencil) {
@@ -598,6 +692,10 @@ fn brush_settings(ui: &mut Ui, tool: Tool, options: &mut Options) {
                 percent(ui, "Smoothing", &mut brush.smoothing, 0.0..=1.0);
                 ui.checkbox(&mut brush.wet_edges, "Wet edges");
                 ui.checkbox(&mut brush.build_up, "Build-up");
+                ui.separator();
+                ui.label("Pen pressure:");
+                ui.checkbox(&mut options.pressure_size, "Size");
+                ui.checkbox(&mut options.pressure_opacity, "Opacity");
             });
         });
     match tool {
@@ -710,6 +808,43 @@ fn type_settings(ui: &mut Ui, options: &mut Options) {
 fn shape_settings(ui: &mut Ui, tool: Tool, options: &mut Options) {
     ui.checkbox(&mut options.shape_fill, "Fill");
     ui.checkbox(&mut options.shape_stroke, "Stroke");
+    use godphoto_core::vector::StrokeAlign;
+    let aligns = [
+        (StrokeAlign::Inside, "Inside"),
+        (StrokeAlign::Center, "Center"),
+        (StrokeAlign::Outside, "Outside"),
+    ];
+    egui::ComboBox::from_id_salt("stroke-align")
+        .selected_text(
+            aligns
+                .iter()
+                .find(|a| a.0 == options.stroke_align)
+                .map_or("", |a| a.1),
+        )
+        .show_ui(ui, |ui| {
+            for (align, name) in aligns {
+                ui.selectable_value(&mut options.stroke_align, align, name);
+            }
+        });
+    let dashes: [(&str, &[f32]); 3] = [
+        ("Solid", &[]),
+        ("Dashed", &[3.0, 2.0]),
+        ("Dotted", &[0.5, 1.5]),
+    ];
+    egui::ComboBox::from_id_salt("stroke-dash")
+        .selected_text(
+            dashes
+                .iter()
+                .find(|d| d.1 == options.dash.as_slice())
+                .map_or("Custom", |d| d.0),
+        )
+        .show_ui(ui, |ui| {
+            for (name, pattern) in dashes {
+                if ui.selectable_label(options.dash == pattern, name).clicked() {
+                    options.dash = pattern.to_vec();
+                }
+            }
+        });
     slider(ui, "Width", &mut options.stroke_width, 0.5..=200.0, " px");
     match tool {
         Tool::Rectangle => {

@@ -6,8 +6,13 @@ mod branding;
 mod canvas;
 mod dialogs;
 mod doc;
+mod layers;
 mod panels;
+mod paths;
+mod pdf;
 mod platform;
+#[cfg(windows)]
+mod print;
 mod theme;
 mod toasts;
 mod tools;

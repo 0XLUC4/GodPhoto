@@ -1,8 +1,14 @@
-//! PSD and PSB: read layers (or the merged image) in RGB, greyscale, indexed, CMYK and
-//! bitmap at 1, 8, 16 or 32 bits; write 8-bit RGB PSD with layers, masks and the merged image.
+//! PSD and PSB: read layers, groups (or the merged image) in RGB, greyscale, indexed, CMYK,
+//! Lab and bitmap at 1, 8, 16 or 32 bits, with the ICC profile; write 8-bit PSD in RGB,
+//! greyscale, CMYK or Lab (after the document's mode) with layers, groups, masks, the
+//! profile and the merged image. Layers without pixels of their own (type, shapes, fills,
+//! smart objects) are written as pixels; adjustments are left out.
 
 use super::{check_layers, check_size, unit};
-use crate::{Blend, Document, Error, GrayImage, Layer, Result, RgbaImage, mul};
+use crate::color::{self, Intent, Profile};
+use crate::{
+    Blend, ColorMode, Content, Document, Error, GrayImage, Group, Layer, Result, RgbaImage,
+};
 
 /// Blend keys and the blend each stands for.
 const BLEND_KEYS: [(&[u8; 4], Blend); 27] = [
@@ -117,12 +123,13 @@ enum Mode {
     Indexed,
     Rgb,
     Cmyk,
+    Lab,
 }
 
 impl Mode {
     fn colors(self) -> usize {
         match self {
-            Self::Rgb => 3,
+            Self::Rgb | Self::Lab => 3,
             Self::Cmyk => 4,
             _ => 1,
         }
@@ -137,6 +144,8 @@ struct Info {
     mode: Mode,
     palette: Vec<u8>,
     psb: bool,
+    /// What CMYK inks are converted through (unused in the other modes).
+    cmyk: Profile,
 }
 
 pub(super) fn read(bytes: &[u8]) -> Result<Document> {
@@ -160,6 +169,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         2 => Mode::Indexed,
         3 => Mode::Rgb,
         4 => Mode::Cmyk,
+        9 => Mode::Lab,
         other => {
             return Err(Error::Format(format!(
                 "PSD colour mode {other} is not supported"
@@ -175,7 +185,16 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
     let color_data = r.u32()? as usize;
     let palette = r.take(color_data)?.to_vec();
     let resources = r.u32()? as usize;
-    let dpi = resolution(r.take(resources)?).unwrap_or(72.0);
+    let (dpi, profile) = image_resources(r.take(resources)?);
+    let own_cmyk = profile
+        .as_deref()
+        .and_then(|icc| Profile::from_icc(icc).ok())
+        .filter(Profile::is_cmyk);
+    let cmyk = match own_cmyk {
+        Some(cmyk) => cmyk,
+        None if mode == Mode::Cmyk => super::cmyk_profile(None)?,
+        None => Profile::srgb(),
+    };
     let info = Info {
         width,
         height,
@@ -183,6 +202,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         mode,
         palette,
         psb,
+        cmyk,
     };
     let section = r.len(psb)?;
     let mut section = r.sub(section)?;
@@ -194,7 +214,16 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
     } else {
         layers
     };
+    let mode = match mode {
+        Mode::Cmyk => ColorMode::Cmyk,
+        Mode::Lab => ColorMode::Lab,
+        Mode::Gray => ColorMode::Grayscale,
+        _ => ColorMode::Rgb,
+    };
     Ok(Document {
+        mode,
+        profile,
+        slices: Vec::new(),
         width,
         height,
         layers,
@@ -204,25 +233,42 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
     })
 }
 
-/// Pixels per inch from the image resources (resolution info, id 0x03ED).
-fn resolution(data: &[u8]) -> Option<f32> {
+/// Pixels per inch (resolution info, id 0x03ED; 72 when missing) and the ICC profile
+/// (id 0x040F) from the image resources. Stops quietly at damage.
+fn image_resources(data: &[u8]) -> (f32, Option<Vec<u8>>) {
+    let (mut dpi, mut profile) = (72.0, None);
     let mut r = Reader::new(data);
     while r.rest() >= 12 {
-        if r.take(4).ok()? != b"8BIM" {
-            return None;
-        }
-        let id = r.u16().ok()?;
-        let name = r.u8().ok()? as usize;
-        r.take(name + (name + 1) % 2).ok()?;
-        let size = r.u32().ok()? as usize;
-        let block = r.take(size).ok()?;
-        let _ = r.take(size % 2);
-        if id == 0x03ED && block.len() >= 4 {
-            let fixed = u32::from_be_bytes(block[..4].try_into().ok()?);
-            return Some(fixed as f32 / 65536.0).filter(|dpi| *dpi > 0.0);
+        let Ok((id, block)) = resource(&mut r) else {
+            break;
+        };
+        match id {
+            0x03ED if block.len() >= 4 => {
+                let fixed = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+                let found = fixed as f32 / 65536.0;
+                if found > 0.0 {
+                    dpi = found;
+                }
+            }
+            0x040F if !block.is_empty() => profile = Some(block.to_vec()),
+            _ => {}
         }
     }
-    None
+    (dpi, profile)
+}
+
+/// One image resource: its id and data.
+fn resource<'a>(r: &mut Reader<'a>) -> Result<(u16, &'a [u8])> {
+    if r.take(4)? != b"8BIM" {
+        return Err(damaged());
+    }
+    let id = r.u16()?;
+    let name = r.u8()? as usize;
+    r.take(name + (name + 1) % 2)?;
+    let size = r.u32()? as usize;
+    let block = r.take(size)?;
+    let _ = r.take(size % 2);
+    Ok((id, block))
 }
 
 /// The layers (bottom first), and whether the merged image's extra channel is transparency.
@@ -266,7 +312,12 @@ struct Record {
     mask: Option<(Rect, u8, u8)>,
     name: String,
     fill: u8,
-    divider: bool,
+    /// Section divider type: 0 a plain layer, 1 open folder, 2 closed folder, 3 group end.
+    section: u32,
+    /// The folder passes blending through.
+    pass: bool,
+    /// Colour tag, 0 none to 7.
+    label: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -321,11 +372,30 @@ fn layer_info(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)>
             let (width, height) = rect.size()?;
             planes.push((id, channel(data, width, height, info)?));
         }
-        if !record.divider {
-            layers.push(build(&record, &planes, info)?);
+        layers.push(build(&record, &planes, info)?);
+    }
+    Ok((balance(layers), Some(merged_alpha)))
+}
+
+/// Drop group markers that have no partner, so every group is whole.
+fn balance(layers: Vec<Layer>) -> Vec<Layer> {
+    let mut keep = vec![true; layers.len()];
+    let mut open = Vec::new();
+    for (index, layer) in layers.iter().enumerate() {
+        match layer.content {
+            Content::GroupEnd => open.push(index),
+            Content::Group(_) if open.pop().is_none() => keep[index] = false,
+            _ => {}
         }
     }
-    Ok((layers, Some(merged_alpha)))
+    for index in open {
+        keep[index] = false;
+    }
+    layers
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(layer, keep)| keep.then_some(layer))
+        .collect()
 }
 
 fn record(r: &mut Reader, psb: bool) -> Result<Record> {
@@ -367,7 +437,7 @@ fn record(r: &mut Reader, psb: bool) -> Result<Record> {
         .map(|&b| b as char)
         .collect();
     let _ = extra.take((4 - (name_length + 1) % 4) % 4);
-    let (mut fill, mut divider) = (255, false);
+    let (mut fill, mut section, mut pass, mut label) = (255, 0, &blend == b"pass", 0);
     // Tagged blocks are optional extras: stop quietly at the first one that does not parse.
     while extra.rest() >= 12 {
         let Ok(signature) = extra.take(4) else { break };
@@ -387,8 +457,14 @@ fn record(r: &mut Reader, psb: bool) -> Result<Record> {
                     name = unicode;
                 }
             }
-            b"lsct" | b"lsdk" => divider = matches!(block.u32(), Ok(1..=3)),
+            b"lsct" | b"lsdk" => {
+                section = block.u32().ok().filter(|t| *t <= 3).unwrap_or(0);
+                if block.take(4).is_ok_and(|s| s == b"8BIM") {
+                    pass |= block.take(4).is_ok_and(|key| key == b"pass");
+                }
+            }
             b"iOpa" => fill = block.u8().unwrap_or(255),
+            b"lclr" => label = block.u16().map_or(0, |c| c.min(7) as u8),
             _ => {}
         }
     }
@@ -402,7 +478,9 @@ fn record(r: &mut Reader, psb: bool) -> Result<Record> {
         mask,
         name,
         fill,
-        divider,
+        section,
+        pass,
+        label,
     })
 }
 
@@ -421,7 +499,7 @@ fn unicode_name(r: &mut Reader) -> Option<String> {
     )
 }
 
-/// One full-canvas layer from a record and its decoded channels.
+/// One full-canvas layer (or group marker) from a record and its decoded channels.
 fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Layer> {
     let plane = |id: i16| {
         planes
@@ -429,16 +507,29 @@ fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Laye
             .find(|(i, _)| *i == id)
             .map(|(_, p)| p.as_slice())
     };
-    let (width, height) = record.rect.size()?;
-    let rgba = to_rgba(
-        info,
-        [plane(0), plane(1), plane(2), plane(3)],
-        plane(-1),
-        width * height,
-    );
-    let mut pixels = RgbaImage::new(info.width, info.height);
-    place(&mut pixels, info.width, &rgba, width, record.rect, 4);
-    let mut layer = Layer::pixels(record.name.clone(), pixels);
+    let mut layer = match record.section {
+        1 | 2 => Layer::new(
+            record.name.clone(),
+            Content::Group(Group {
+                open: record.section == 1,
+                pass_through: record.pass,
+                artboard: None,
+            }),
+        ),
+        3 => Layer::new("", Content::GroupEnd),
+        _ => {
+            let (width, height) = record.rect.size()?;
+            let rgba = to_rgba(
+                info,
+                [plane(0), plane(1), plane(2), plane(3)],
+                plane(-1),
+                width * height,
+            );
+            let mut pixels = RgbaImage::new(info.width, info.height);
+            place(&mut pixels, info.width, &rgba, width, record.rect, 4);
+            Layer::pixels(record.name.clone(), pixels)
+        }
+    };
     if let (Some((rect, default, flags)), Some(mask)) = (record.mask, plane(-2)) {
         let (mask_width, _) = rect.size()?;
         let mut canvas = GrayImage::from_pixel(info.width, info.height, image::Luma([default]));
@@ -450,6 +541,7 @@ fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Laye
     layer.opacity = unit(record.opacity as f32 / 255.0);
     layer.fill = unit(record.fill as f32 / 255.0);
     layer.clipped = record.clipping != 0;
+    layer.label = record.label;
     layer.blend = BLEND_KEYS
         .iter()
         .find(|(key, _)| **key == record.blend)
@@ -493,23 +585,48 @@ fn to_rgba(info: &Info, color: [Option<&[u8]>; 4], alpha: Option<&[u8]>, n: usiz
     let at = |plane: Option<&[u8]>, i: usize, default: u8| {
         plane.and_then(|p| p.get(i)).copied().unwrap_or(default)
     };
-    let mut out = Vec::with_capacity(n * 4);
-    for i in 0..n {
-        let c = |k: usize| at(color[k], i, 0);
-        let rgb = match info.mode {
-            Mode::Rgb => [c(0), c(1), c(2)],
-            Mode::Gray | Mode::Bitmap => [c(0); 3],
-            Mode::Indexed => {
-                let index = c(0) as usize;
-                [0, 256, 512].map(|offset| info.palette.get(offset + index).copied().unwrap_or(0))
-            }
-            // CMYK is stored inverted: 255 is no ink.
-            Mode::Cmyk => {
-                let k = at(color[3], i, 255);
-                [0, 1, 2].map(|j| mul(at(color[j], i, 255), k))
-            }
-        };
-        out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], at(alpha, i, 255)]);
+    // The conversions work on images: the pixels go in as one row.
+    let row = u32::try_from(n).unwrap_or(0);
+    let mut out = match info.mode {
+        // CMYK is stored inverted: 255 is no ink.
+        Mode::Cmyk => {
+            let inks: Vec<[u8; 4]> = (0..n)
+                .map(|i| [0, 1, 2, 3].map(|k| 255 - at(color[k], i, 255)))
+                .collect();
+            let srgb = Profile::srgb();
+            color::cmyk_to_rgb(&inks, row, 1, &info.cmyk, &srgb, Intent::default()).into_raw()
+        }
+        Mode::Lab => {
+            let lab: Vec<[u8; 3]> = (0..n)
+                .map(|i| {
+                    [
+                        at(color[0], i, 0),
+                        at(color[1], i, 128),
+                        at(color[2], i, 128),
+                    ]
+                })
+                .collect();
+            color::lab_to_image(&lab, row, 1, &Profile::srgb()).into_raw()
+        }
+        _ => (0..n)
+            .flat_map(|i| {
+                let c = |k: usize| at(color[k], i, 0);
+                let [r, g, b] = match info.mode {
+                    Mode::Rgb => [c(0), c(1), c(2)],
+                    Mode::Indexed => {
+                        let index = c(0) as usize;
+                        [0, 256, 512]
+                            .map(|offset| info.palette.get(offset + index).copied().unwrap_or(0))
+                    }
+                    _ => [c(0); 3],
+                };
+                [r, g, b, 255]
+            })
+            .collect(),
+    };
+    out.resize(n * 4, 255);
+    for (i, pixel) in out.chunks_exact_mut(4).enumerate() {
+        pixel[3] = at(alpha, i, 255);
     }
     out
 }
@@ -654,34 +771,91 @@ fn merged(r: &mut Reader, info: &Info, channels: usize, alpha: bool) -> Result<R
     RgbaImage::from_raw(info.width, info.height, rgba).ok_or_else(damaged)
 }
 
-/// 8-bit RGB PSD (version 1) with every layer that has pixels, its mask and the merged image.
+/// The colour space a PSD is written in.
+enum Space {
+    Rgb,
+    Gray,
+    /// Through this CMYK profile.
+    Cmyk(Box<Profile>),
+    Lab,
+}
+
+impl Space {
+    /// The PSD colour mode number.
+    fn code(&self) -> u16 {
+        match self {
+            Self::Gray => 1,
+            Self::Rgb => 3,
+            Self::Cmyk(_) => 4,
+            Self::Lab => 9,
+        }
+    }
+
+    /// The colour channels of `image`, as stored (alpha apart).
+    fn planes(&self, image: &RgbaImage) -> Vec<Vec<u8>> {
+        match self {
+            Self::Rgb => (0..3).map(|c| plane(image, c)).collect(),
+            // The same grey the document shows in grayscale mode.
+            Self::Gray => {
+                let mut gray = image.clone();
+                crate::adjust::desaturate(&mut gray);
+                vec![plane(&gray, 0)]
+            }
+            Self::Cmyk(profile) => {
+                let inks = color::rgb_to_cmyk(image, &Profile::srgb(), profile, Intent::default());
+                // Stored inverted: 255 is no ink.
+                (0..4)
+                    .map(|k| inks.iter().map(|ink| 255 - ink[k]).collect())
+                    .collect()
+            }
+            Self::Lab => {
+                let lab = color::image_to_lab(image, &Profile::srgb());
+                (0..3).map(|k| lab.iter().map(|v| v[k]).collect()).collect()
+            }
+        }
+    }
+}
+
+/// 8-bit PSD (version 1) in the document's colour mode (indexed and bitmap as RGB) with
+/// every layer that has pixels, groups, masks, the profile and the merged image.
 pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     let (width, height) = (doc.width, doc.height);
     check_size(width, height)?;
+    let space = match doc.mode {
+        ColorMode::Cmyk => Space::Cmyk(Box::new(super::cmyk_profile(doc.profile.as_deref())?)),
+        ColorMode::Lab => Space::Lab,
+        ColorMode::Grayscale => Space::Gray,
+        _ => Space::Rgb,
+    };
+    let fits = |gray: bool| {
+        doc.profile.clone().filter(|icc| {
+            Profile::from_icc(icc).is_ok_and(|p| if gray { p.is_gray() } else { p.is_rgb() })
+        })
+    };
+    let icc = match &space {
+        Space::Cmyk(profile) => Some(profile.icc()),
+        Space::Lab => None,
+        Space::Gray => fits(true),
+        Space::Rgb => fits(false),
+    }
+    .filter(|icc| !icc.is_empty());
+
+    let colors = space.planes(&RgbaImage::new(1, 1)).len();
     let mut out = Vec::new();
     out.extend_from_slice(b"8BPS");
     put16(&mut out, 1);
     out.extend_from_slice(&[0; 6]);
-    put16(&mut out, 4);
+    put16(&mut out, colors as u16 + 1);
     put32(&mut out, height);
     put32(&mut out, width);
     put16(&mut out, 8);
-    put16(&mut out, 3);
+    put16(&mut out, space.code());
     put32(&mut out, 0); // no colour mode data
-    // Resolution info: pixels per inch, horizontal and vertical.
-    let dpi = (doc.dpi.clamp(1.0, 30_000.0) * 65536.0).round() as u32;
-    put32(&mut out, 28);
-    out.extend_from_slice(b"8BIM");
-    put16(&mut out, 0x03ED);
-    out.extend_from_slice(&[0, 0]);
-    put32(&mut out, 16);
-    for _ in 0..2 {
-        put32(&mut out, dpi);
-        put16(&mut out, 1);
-        put16(&mut out, 1);
-    }
+    let resources = image_resources_bytes(doc.dpi, icc.as_deref())?;
+    put32(&mut out, resources.len() as u32);
+    out.extend_from_slice(&resources);
 
-    let info = layers(doc)?;
+    let info = layers(doc, &space)?;
     let section = 4 + info.len() + 4;
     put32(&mut out, u32::try_from(section).map_err(|_| too_big())?);
     put32(&mut out, info.len() as u32);
@@ -691,16 +865,40 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     let composite = doc.composite();
     put16(&mut out, 1);
     let (mut counts, mut data) = (Vec::new(), Vec::new());
-    for c in 0..4 {
-        pack_plane(
-            &plane(&composite, c),
-            width as usize,
-            &mut counts,
-            &mut data,
-        );
+    let mut planes = space.planes(&composite);
+    planes.push(plane(&composite, 3));
+    for plane in &planes {
+        pack_plane(plane, width as usize, &mut counts, &mut data);
     }
     out.extend_from_slice(&counts);
     out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// Resolution info (pixels per inch, horizontal and vertical) and the ICC profile.
+fn image_resources_bytes(dpi: f32, icc: Option<&[u8]>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let fixed = (dpi.clamp(1.0, 30_000.0) * 65536.0).round() as u32;
+    out.extend_from_slice(b"8BIM");
+    put16(&mut out, 0x03ED);
+    out.extend_from_slice(&[0, 0]);
+    put32(&mut out, 16);
+    for _ in 0..2 {
+        put32(&mut out, fixed);
+        put16(&mut out, 1);
+        put16(&mut out, 1);
+    }
+    if let Some(icc) = icc {
+        out.extend_from_slice(b"8BIM");
+        put16(&mut out, 0x040F);
+        out.extend_from_slice(&[0, 0]);
+        put32(&mut out, u32::try_from(icc.len()).map_err(|_| too_big())?);
+        out.extend_from_slice(icc);
+        if icc.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+    u32::try_from(out.len()).map_err(|_| too_big())?;
     Ok(out)
 }
 
@@ -708,23 +906,36 @@ fn too_big() -> Error {
     Error::Format("too much data for a PSD file".into())
 }
 
+/// Channel ids and their encoded data.
+type Channels = Vec<(i16, Vec<u8>)>;
+
 /// The layer info block: count, records, then every channel's data.
-fn layers(doc: &Document) -> Result<Vec<u8>> {
+fn layers(doc: &Document, space: &Space) -> Result<Vec<u8>> {
     let (width, height) = (doc.width, doc.height);
-    let rendered: Vec<(&Layer, RgbaImage)> = doc
-        .layers
-        .iter()
-        .filter_map(|layer| layer.render(width, height).map(|p| (layer, p)))
-        .collect();
-    let count = i16::try_from(rendered.len()).map_err(|_| too_big())?;
+    let colors = space.planes(&RgbaImage::new(1, 1)).len() as i16;
+    let mut entries: Vec<(&Layer, Channels)> = Vec::new();
+    for layer in &doc.layers {
+        let channels = if layer.content.is_group() {
+            // Group markers have no pixels: every channel is raw and empty.
+            (-1..colors).map(|id| (id, vec![0, 0])).collect()
+        } else {
+            let Some(pixels) = layer.render(width, height) else {
+                continue; // adjustments have no pixels to store
+            };
+            let mut channels = vec![(-1, rle_channel(&plane(&pixels, 3), width as usize))];
+            for (id, plane) in space.planes(&pixels).iter().enumerate() {
+                channels.push((id as i16, rle_channel(plane, width as usize)));
+            }
+            channels
+        };
+        entries.push((layer, channels));
+    }
+    let count = i16::try_from(entries.len()).map_err(|_| too_big())?;
     let mut records = Vec::new();
-    // Negative count: the merged image's fourth channel is its transparency.
+    // Negative count: the merged image's extra channel is its transparency.
     records.extend_from_slice(&(-count).to_be_bytes());
     let mut data = Vec::new();
-    for (layer, pixels) in &rendered {
-        let mut channels: Vec<(i16, Vec<u8>)> = [(-1, 3), (0, 0), (1, 1), (2, 2)]
-            .map(|(id, c)| (id, rle_channel(&plane(pixels, c), width as usize)))
-            .into();
+    for (layer, mut channels) in entries {
         if let Some(mask) = &layer.mask {
             channels.push((-2, rle_channel(mask.as_raw(), width as usize)));
         }
@@ -749,18 +960,30 @@ fn write_record(
     height: u32,
 ) -> Result<()> {
     let full = [0, 0, height, width];
-    full.iter().for_each(|&v| put32(out, v));
+    let rect = if layer.content.is_group() {
+        [0; 4]
+    } else {
+        full
+    };
+    rect.iter().for_each(|&v| put32(out, v));
     put16(out, channels.len() as u16);
     for (id, bytes) in channels {
         out.extend_from_slice(&id.to_be_bytes());
         put32(out, u32::try_from(bytes.len()).map_err(|_| too_big())?);
     }
     out.extend_from_slice(b"8BIM");
+    let pass = matches!(
+        &layer.content,
+        Content::Group(Group {
+            pass_through: true,
+            ..
+        })
+    );
     let key = BLEND_KEYS
         .iter()
         .find(|(_, b)| *b == layer.blend)
         .map_or(b"norm", |(key, _)| *key);
-    out.extend_from_slice(key);
+    out.extend_from_slice(if pass { b"pass" } else { key });
     out.push((unit(layer.opacity) * 255.0).round() as u8);
     out.push(u8::from(layer.clipped));
     out.push(if layer.visible { 0 } else { 2 });
@@ -781,9 +1004,12 @@ fn write_record(
     for _ in 0..10 {
         extra.extend_from_slice(&[0, 0, 255, 255]);
     }
+    let name = match layer.content {
+        Content::GroupEnd => "</Layer group>",
+        _ => layer.name.as_str(),
+    };
     // Pascal name: ASCII only, the full name goes in `luni`.
-    let ascii: Vec<u8> = layer
-        .name
+    let ascii: Vec<u8> = name
         .chars()
         .take(255)
         .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
@@ -791,7 +1017,7 @@ fn write_record(
     extra.push(ascii.len() as u8);
     extra.extend_from_slice(&ascii);
     extra.resize(extra.len() + (4 - (ascii.len() + 1) % 4) % 4, 0);
-    let units: Vec<u16> = layer.name.encode_utf16().collect();
+    let units: Vec<u16> = name.encode_utf16().collect();
     extra.extend_from_slice(b"8BIMluni");
     put32(&mut extra, 4 + 2 * units.len() as u32);
     put32(&mut extra, units.len() as u32);
@@ -801,6 +1027,25 @@ fn write_record(
     extra.extend_from_slice(b"8BIMiOpa");
     put32(&mut extra, 4);
     extra.extend_from_slice(&[(unit(layer.fill) * 255.0).round() as u8, 0, 0, 0]);
+    let section = match &layer.content {
+        Content::Group(group) => Some(if group.open { 1 } else { 2 }),
+        Content::GroupEnd => Some(3),
+        _ => None,
+    };
+    if let Some(section) = section {
+        extra.extend_from_slice(b"8BIMlsct");
+        put32(&mut extra, if pass { 12 } else { 4 });
+        put32(&mut extra, section);
+        if pass {
+            extra.extend_from_slice(b"8BIMpass");
+        }
+    }
+    if layer.label != 0 {
+        extra.extend_from_slice(b"8BIMlclr");
+        put32(&mut extra, 8);
+        put16(&mut extra, layer.label.min(7) as u16);
+        extra.extend_from_slice(&[0; 6]);
+    }
     put32(out, extra.len() as u32);
     out.extend_from_slice(&extra);
     Ok(())
@@ -863,7 +1108,7 @@ fn put32(out: &mut Vec<u8>, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Background, Content, Rgba};
+    use crate::{Background, Rgba};
 
     fn sample() -> Document {
         let mut doc = Document::new(7, 5, Background::Transparent);
@@ -909,7 +1154,11 @@ mod tests {
     fn psd_merged_image_is_the_fallback() {
         let mut bytes = write(&sample()).unwrap();
         // Zero the layer count: the reader must use the merged image.
-        let at = 26 + 4 + 4 + 28 + 4 + 4;
+        let length = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let mut at = 26;
+        at += 4 + length(at); // colour mode data
+        at += 4 + length(at); // image resources
+        at += 4 + 4; // section and layer info lengths
         bytes[at..at + 2].copy_from_slice(&0i16.to_be_bytes());
         let back = read(&bytes).unwrap();
         assert_eq!(back.layers.len(), 1);
@@ -917,6 +1166,113 @@ mod tests {
             back.layers[0].content,
             Content::Pixels(sample().composite())
         );
+    }
+
+    #[test]
+    fn psd_round_trip_keeps_groups() {
+        let mut doc = Document::new(4, 3, Background::White);
+        doc.layers.push(Layer::new("", Content::GroupEnd));
+        doc.layers.push(Layer::pixels(
+            "A",
+            RgbaImage::from_pixel(4, 3, Rgba([9, 8, 7, 255])),
+        ));
+        doc.layers.push(Layer::new("", Content::GroupEnd));
+        let mut fill = Layer::new("Fill ✓", Content::Fill([200, 10, 10, 128]));
+        fill.label = 3;
+        doc.layers.push(fill);
+        let mut inner = Layer::group("Inner");
+        inner.content = Content::Group(Group {
+            open: false,
+            pass_through: false,
+            artboard: None,
+        });
+        inner.opacity = 0.5;
+        inner.blend = Blend::Screen;
+        doc.layers.push(inner);
+        let mut outer = Layer::group("Outer");
+        outer.visible = false;
+        outer.label = 5;
+        doc.layers.push(outer);
+
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.layers.len(), doc.layers.len());
+        for (a, b) in doc.layers.iter().zip(&back.layers) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.label, b.label);
+            assert_eq!(a.visible, b.visible);
+            if a.content.is_group() {
+                assert_eq!(a.content, b.content);
+                assert_eq!(a.blend, b.blend);
+                assert!((a.opacity - b.opacity).abs() < 1.0 / 255.0);
+            }
+        }
+        // The fill layer comes back as its pixels.
+        assert_eq!(
+            back.layers[4].content,
+            Content::Pixels(RgbaImage::from_pixel(4, 3, Rgba([200, 10, 10, 128])))
+        );
+        assert_eq!(back.group_header(1), Some(6));
+        assert_eq!(back.group_header(3), Some(5));
+    }
+
+    #[test]
+    fn stray_group_markers_are_dropped() {
+        let layers = vec![
+            Layer::group("Stray header"),
+            Layer::new("", Content::GroupEnd),
+            Layer::pixels("A", RgbaImage::new(1, 1)),
+            Layer::group("G"),
+            Layer::new("", Content::GroupEnd),
+        ];
+        let kept: Vec<&str> = balance(layers).iter().map(|l| l.content.kind()).collect();
+        assert_eq!(kept, ["End of group", "Pixels", "Group"]);
+    }
+
+    #[test]
+    fn psd_keeps_the_icc_profile() {
+        let icc = Profile::srgb().icc();
+        assert!(!icc.is_empty());
+        let mut doc = sample();
+        doc.profile = Some(icc.clone());
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.profile, Some(icc));
+        assert_eq!(back.mode, ColorMode::Rgb);
+    }
+
+    /// Write `doc` in `mode`, read it back, and check the composite stays within `tolerance`.
+    fn mode_round_trip(mode: ColorMode, tolerance: u8) -> Document {
+        let mut doc = Document::new(6, 2, Background::Transparent);
+        doc.layers[0].content = Content::Pixels(RgbaImage::from_fn(6, 2, |x, y| {
+            let shades = [
+                [200, 60, 40],
+                [40, 160, 90],
+                [70, 90, 200],
+                [128, 128, 128],
+                [240, 230, 200],
+                [20, 20, 30],
+            ];
+            let [r, g, b] = shades[x as usize];
+            Rgba([r, g, b, if y == 0 { 255 } else { 120 }])
+        }));
+        doc.mode = mode;
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.mode, mode);
+        assert_eq!(back.layers.len(), 1);
+        let (want, got) = (doc.composite(), back.composite());
+        for (p, q) in want.pixels().zip(got.pixels()) {
+            assert_eq!(p[3], q[3]);
+            for c in 0..3 {
+                assert!(p[c].abs_diff(q[c]) <= tolerance, "{mode:?}: {p:?} vs {q:?}");
+            }
+        }
+        back
+    }
+
+    #[test]
+    fn psd_writes_cmyk_lab_and_gray() {
+        mode_round_trip(ColorMode::Cmyk, 16);
+        mode_round_trip(ColorMode::Lab, 4);
+        mode_round_trip(ColorMode::Grayscale, 1);
     }
 
     #[test]

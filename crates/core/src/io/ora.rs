@@ -1,5 +1,6 @@
 //! OpenRaster: a zip with `mimetype`, `stack.xml`, one PNG per layer, `mergedimage.png`
-//! and a thumbnail.
+//! and a thumbnail. Groups are nested `<stack>`s; layers without pixels of their own
+//! (type, shapes, fills, smart objects) are saved drawn.
 
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -7,8 +8,9 @@ use std::io::Cursor;
 use image::ExtendedColorType;
 use zip::{ZipArchive, ZipWriter};
 
+use super::xml::{Tag, tags};
 use super::{Zip, check_layers, check_size, decode, png, unit, zip_add, zip_read};
-use crate::{Blend, Document, Error, Layer, Result, RgbaImage, apply_mask};
+use crate::{Blend, Content, Document, Error, Group, Layer, Result, RgbaImage, apply_mask};
 
 /// `composite-op` values and the blend each stands for.
 const OPS: [(&str, Blend); 17] = [
@@ -36,8 +38,37 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     let mut zip: Zip = ZipWriter::new(Cursor::new(Vec::new()));
     zip_add(&mut zip, "mimetype", b"image/openraster", false)?;
     let mut stack = String::new();
-    // The stack lists the top layer first.
+    // Groups open and not yet closed.
+    let mut open = 0;
+    // The stack lists the top layer first: a group's header, its layers, then its end.
     for (index, layer) in doc.layers.iter().enumerate().rev() {
+        match &layer.content {
+            Content::Group(group) => {
+                let _ = writeln!(
+                    stack,
+                    r#"  <stack name="{}" opacity="{}" visibility="{}" composite-op="{}" isolation="{}">"#,
+                    escape(&layer.name),
+                    layer.opacity,
+                    if layer.visible { "visible" } else { "hidden" },
+                    op_of(layer.blend),
+                    if group.pass_through {
+                        "auto"
+                    } else {
+                        "isolate"
+                    },
+                );
+                open += 1;
+                continue;
+            }
+            Content::GroupEnd => {
+                if open > 0 {
+                    open -= 1;
+                    stack.push_str("  </stack>\n");
+                }
+                continue;
+            }
+            _ => {}
+        }
         let Some(mut pixels) = layer.render(width, height) else {
             continue; // adjustments have no pixels to store
         };
@@ -46,17 +77,17 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
         }
         let src = format!("data/layer-{index}.png");
         zip_add(&mut zip, &src, &rgba_png(&pixels)?, false)?;
-        let op = OPS
-            .iter()
-            .find(|(_, blend)| *blend == layer.blend)
-            .map_or("svg:src-over", |(op, _)| op);
         let _ = writeln!(
             stack,
-            r#"  <layer name="{}" src="{src}" x="0" y="0" opacity="{}" visibility="{}" composite-op="{op}"/>"#,
+            r#"  <layer name="{}" src="{src}" x="0" y="0" opacity="{}" visibility="{}" composite-op="{}"/>"#,
             escape(&layer.name),
             layer.opacity * layer.fill,
             if layer.visible { "visible" } else { "hidden" },
+            op_of(layer.blend),
         );
+    }
+    for _ in 0..open {
+        stack.push_str("  </stack>\n");
     }
     let dpi = doc.dpi;
     let xml = format!(
@@ -73,6 +104,21 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
         false,
     )?;
     Ok(zip.finish()?.into_inner())
+}
+
+/// The `composite-op` of a blend; src-over for blends OpenRaster lacks.
+fn op_of(blend: Blend) -> &'static str {
+    OPS.iter()
+        .find(|(_, b)| *b == blend)
+        .map_or("svg:src-over", |(op, _)| op)
+}
+
+/// The blend of a tag's `composite-op`.
+fn blend_of(tag: &Tag) -> Blend {
+    let op = tag.attr("composite-op").unwrap_or("svg:src-over");
+    OPS.iter()
+        .find(|(name, _)| *name == op)
+        .map_or(Blend::Normal, |(_, b)| *b)
 }
 
 /// The image shrunk to fit 256 px, keeping its shape; None when already small enough.
@@ -122,15 +168,36 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         height,
     )?;
 
-    // Groups are flattened; their visibility and opacity pass on to their layers.
-    let mut groups: Vec<(bool, f32)> = Vec::new();
+    // Top first while reading. `depth` counts the open stacks, the root one included.
     let mut layers = Vec::new();
+    let mut depth = 0;
     for tag in &tags {
         match (tag.name, tag.closing) {
             ("stack", true) => {
-                groups.pop();
+                if depth > 1 {
+                    layers.push(Layer::new("", Content::GroupEnd));
+                }
+                depth = usize::saturating_sub(depth, 1);
             }
-            ("stack", false) if !tag.empty => groups.push((visible(tag), opacity(tag))),
+            ("stack", false) if depth == 0 => depth = usize::from(!tag.empty),
+            ("stack", false) => {
+                let group = Group {
+                    open: true,
+                    pass_through: tag.attr("isolation") != Some("isolate"),
+                    artboard: None,
+                };
+                let mut layer =
+                    Layer::new(tag.attr("name").unwrap_or("Group"), Content::Group(group));
+                layer.visible = visible(tag);
+                layer.opacity = opacity(tag);
+                layer.blend = blend_of(tag);
+                layers.push(layer);
+                if tag.empty {
+                    layers.push(Layer::new("", Content::GroupEnd));
+                } else {
+                    depth += 1;
+                }
+            }
             ("layer", false) => {
                 let Some(src) = tag.attr("src") else { continue };
                 let image = decode(&zip_read(&mut archive, src)?, None)?.to_rgba8();
@@ -139,20 +206,21 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
                 let mut pixels = RgbaImage::new(width, height);
                 image::imageops::replace(&mut pixels, &image, x, y);
                 let mut layer = Layer::pixels(tag.attr("name").unwrap_or("Layer"), pixels);
-                layer.visible = visible(tag) && groups.iter().all(|group| group.0);
-                layer.opacity = groups.iter().fold(opacity(tag), |o, group| o * group.1);
-                let op = tag.attr("composite-op").unwrap_or("svg:src-over");
-                layer.blend = OPS
-                    .iter()
-                    .find(|(name, _)| *name == op)
-                    .map_or(Blend::Normal, |(_, b)| *b);
+                layer.visible = visible(tag);
+                layer.opacity = opacity(tag);
+                layer.blend = blend_of(tag);
                 layers.push(layer);
             }
             _ => {}
         }
     }
+    // Stacks left open by a damaged file end at the bottom.
+    for _ in 1..depth {
+        layers.push(Layer::new("", Content::GroupEnd));
+    }
     layers.reverse();
-    if layers.is_empty() {
+    if !layers.iter().any(Layer::is_pixels) {
+        layers.clear();
         let merged = decode(&zip_read(&mut archive, "mergedimage.png")?, None)?.to_rgba8();
         if merged.dimensions() != (width, height) {
             return Err(Error::Format(
@@ -162,6 +230,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         layers.push(Layer::pixels("Background", merged));
     }
     Ok(Document {
+        mode: Default::default(),
+        profile: None,
+        slices: Vec::new(),
         width,
         height,
         layers,
@@ -181,117 +252,6 @@ fn opacity(tag: &Tag) -> f32 {
         .map_or(1.0, unit)
 }
 
-/// One XML tag, enough of XML for `stack.xml`.
-struct Tag<'a> {
-    name: &'a str,
-    closing: bool,
-    /// Self-closing: `<stack/>`.
-    empty: bool,
-    attrs: Vec<(&'a str, String)>,
-}
-
-impl Tag<'_> {
-    fn attr(&self, key: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.as_str())
-    }
-}
-
-/// The tags of `xml` in order, skipping declarations and comments.
-fn tags(xml: &str) -> Vec<Tag<'_>> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find('<') {
-        rest = &rest[start + 1..];
-        if let Some(comment) = rest.strip_prefix("!--") {
-            let Some(end) = comment.find("-->") else {
-                break;
-            };
-            rest = &comment[end + 3..];
-            continue;
-        }
-        let Some(end) = rest.find('>') else { break };
-        let body = &rest[..end];
-        rest = &rest[end + 1..];
-        if body.starts_with('?') || body.starts_with('!') {
-            continue;
-        }
-        let closing = body.starts_with('/');
-        let empty = body.ends_with('/');
-        let body = body.trim_start_matches('/').trim_end_matches('/');
-        let name_end = body.find(char::is_whitespace).unwrap_or(body.len());
-        out.push(Tag {
-            name: &body[..name_end],
-            closing,
-            empty,
-            attrs: attributes(&body[name_end..]),
-        });
-    }
-    out
-}
-
-fn attributes(mut text: &str) -> Vec<(&str, String)> {
-    let mut out = Vec::new();
-    while let Some(eq) = text.find('=') {
-        let key = text[..eq].trim();
-        let after = text[eq + 1..].trim_start();
-        let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-            break;
-        };
-        let value = &after[1..];
-        let Some(close) = value.find(quote) else {
-            break;
-        };
-        out.push((key, unescape(&value[..close])));
-        text = &value[close + 1..];
-    }
-    out
-}
-
-fn unescape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        let decoded = rest.find(';').and_then(|semi| {
-            let entity = &rest[1..semi];
-            let c = match entity {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                _ => {
-                    let code = match entity
-                        .strip_prefix("#x")
-                        .or_else(|| entity.strip_prefix("#X"))
-                    {
-                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                        None => entity.strip_prefix('#').and_then(|dec| dec.parse().ok()),
-                    };
-                    code.and_then(char::from_u32)
-                }
-            };
-            c.map(|c| (c, semi))
-        });
-        match decoded {
-            Some((c, semi)) => {
-                out.push(c);
-                rest = &rest[semi + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -302,7 +262,8 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Background, Content, Rgba};
+    use crate::vector::{Anchor, PathOp, SubPath, Vector};
+    use crate::{Background, Rgba};
 
     fn two_layers() -> Document {
         let mut doc = Document::new(4, 3, Background::White);
@@ -348,14 +309,83 @@ mod tests {
         let dot = RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 255]));
         zip_add(&mut zip, "a.png", &rgba_png(&dot).unwrap(), false).unwrap();
         let doc = read(&zip.finish().unwrap().into_inner()).unwrap();
-        let layer = &doc.layers[0];
-        assert!(!layer.visible);
-        assert!((layer.opacity - 0.25).abs() < 1e-6);
+        assert_eq!(doc.layers.len(), 3);
+        assert_eq!(doc.layers[0].content, Content::GroupEnd);
+        let group = &doc.layers[2];
+        assert!(!group.visible && matches!(group.content, Content::Group(_)));
+        assert!((group.opacity - 0.5).abs() < 1e-6);
+        let layer = &doc.layers[1];
+        assert!(layer.visible);
+        assert!((layer.opacity - 0.5).abs() < 1e-6);
         let Content::Pixels(pixels) = &layer.content else {
             panic!()
         };
         assert_eq!(pixels.get_pixel(1, 1), &Rgba([1, 2, 3, 255]));
         assert_eq!(pixels.get_pixel(0, 0)[3], 0);
+    }
+
+    #[test]
+    fn ora_keeps_nested_groups_and_draws_shapes() {
+        let mut doc = two_layers();
+        doc.layers.insert(1, Layer::new("", Content::GroupEnd));
+        doc.layers.insert(2, Layer::new("", Content::GroupEnd));
+        let shape = Vector {
+            paths: vec![SubPath {
+                anchors: vec![
+                    Anchor::corner(0.0, 0.0),
+                    Anchor::corner(4.0, 0.0),
+                    Anchor::corner(4.0, 3.0),
+                    Anchor::corner(0.0, 3.0),
+                ],
+                closed: true,
+                op: PathOp::Unite,
+            }],
+            fill: Some([0, 0, 255, 255]),
+            gradient: None,
+            stroke: None,
+        };
+        doc.layers
+            .insert(3, Layer::new("Shape", Content::Shape(shape)));
+        let mut inner = Layer::group("Inner");
+        inner.content = Content::Group(Group {
+            pass_through: false,
+            ..Group::default()
+        });
+        inner.opacity = 0.5;
+        inner.blend = Blend::Screen;
+        doc.layers.insert(4, inner);
+        doc.layers.push(Layer::group("Outer & co"));
+        let back = read(&write(&doc).unwrap()).unwrap();
+        let kinds: Vec<_> = back.layers.iter().map(|l| l.content.kind()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "Pixels",
+                "End of group",
+                "End of group",
+                "Pixels",
+                "Group",
+                "Pixels",
+                "Group"
+            ]
+        );
+        let names: Vec<_> = back.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names[3..],
+            ["Shape", "Inner", "A & <B> \"é\"", "Outer & co"]
+        );
+        let inner = &back.layers[4];
+        assert_eq!(inner.blend, Blend::Screen);
+        assert!((inner.opacity - 0.5).abs() < 1e-6);
+        assert_eq!(
+            inner.content,
+            Content::Group(Group {
+                pass_through: false,
+                ..Group::default()
+            })
+        );
+        assert!(matches!(&back.layers[6].content, Content::Group(g) if g.pass_through));
+        assert_eq!(back.composite(), doc.composite());
     }
 
     #[test]

@@ -1,15 +1,23 @@
-//! Opening and saving documents: the native file, OpenRaster, PSD/PSB and flat images.
+//! Opening and saving documents: the native file, OpenRaster, PSD/PSB, KRA, PDN, SVG,
+//! FITS and flat images.
 
+mod fits;
+mod kra;
 mod native;
 mod ora;
+mod pdn;
 mod psd;
+mod svg;
+mod xml;
 
 use std::borrow::Cow;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
+use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::codecs::tiff::TiffEncoder;
 use image::{
     DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageFormat, ImageReader,
 };
@@ -17,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::{Document, Error, Result, RgbaImage, mul};
+use crate::color::{self, Intent, Profile};
+use crate::{ColorMode, Document, Error, Result, RgbaImage, luma, mul};
 
 /// Longest side accepted when opening or saving.
 const MAX_SIDE: u32 = 30_000;
@@ -49,14 +58,27 @@ pub enum Format {
     Pnm,
     Hdr,
     Exr,
+    /// Written only: no pure-Rust decoder is available.
+    Avif,
+    /// Flexible Image Transport System, as used in astronomy.
+    Fits,
+    /// Opened only: paths become shape layers, the rest pixel layers.
+    Svg,
+    /// Opened only.
+    Kra,
+    /// Opened only.
+    Pdn,
 }
 
 impl Format {
     /// Every format, layered ones first.
-    pub const ALL: [Format; 15] = [
+    pub const ALL: [Format; 20] = [
         Self::Native,
         Self::OpenRaster,
         Self::Psd,
+        Self::Kra,
+        Self::Pdn,
+        Self::Svg,
         Self::Png,
         Self::Jpeg,
         Self::Bmp,
@@ -69,6 +91,8 @@ impl Format {
         Self::Pnm,
         Self::Hdr,
         Self::Exr,
+        Self::Avif,
+        Self::Fits,
     ];
 
     /// The format a file name's extension names, ignoring case.
@@ -97,6 +121,11 @@ impl Format {
             Self::Pnm => &["pnm", "ppm", "pgm", "pbm", "pam"],
             Self::Hdr => &["hdr"],
             Self::Exr => &["exr"],
+            Self::Avif => &["avif"],
+            Self::Fits => &["fits", "fit", "fts"],
+            Self::Svg => &["svg", "svgz"],
+            Self::Kra => &["kra"],
+            Self::Pdn => &["pdn"],
         }
     }
 
@@ -118,27 +147,46 @@ impl Format {
             Self::Pnm => "PNM",
             Self::Hdr => "HDR",
             Self::Exr => "OpenEXR",
+            Self::Avif => "AVIF",
+            Self::Fits => "FITS",
+            Self::Svg => "SVG",
+            Self::Kra => "Krita",
+            Self::Pdn => "Paint.NET",
         }
     }
 
     /// Keeps layers.
     pub fn layered(self) -> bool {
-        matches!(self, Self::Native | Self::OpenRaster | Self::Psd)
+        matches!(
+            self,
+            Self::Native | Self::OpenRaster | Self::Psd | Self::Kra | Self::Pdn | Self::Svg
+        )
     }
 
     /// Loses detail when saved (has a quality setting).
     pub fn lossy(self) -> bool {
-        self == Self::Jpeg
+        matches!(self, Self::Jpeg | Self::Avif)
     }
 
-    /// Can be saved (every format; ICO only up to 256 px).
+    /// Can be saved (ICO only up to 256 px).
     pub fn can_write(self) -> bool {
-        true
+        !matches!(self, Self::Svg | Self::Kra | Self::Pdn)
+    }
+
+    /// Can be opened.
+    pub fn can_read(self) -> bool {
+        self != Self::Avif
     }
 
     fn image_format(self) -> Option<ImageFormat> {
         Some(match self {
-            Self::Native | Self::OpenRaster | Self::Psd => return None,
+            Self::Native
+            | Self::OpenRaster
+            | Self::Psd
+            | Self::Fits
+            | Self::Svg
+            | Self::Kra
+            | Self::Pdn => return None,
             Self::Png => ImageFormat::Png,
             Self::Jpeg => ImageFormat::Jpeg,
             Self::Bmp => ImageFormat::Bmp,
@@ -151,19 +199,23 @@ impl Format {
             Self::Pnm => ImageFormat::Pnm,
             Self::Hdr => ImageFormat::Hdr,
             Self::Exr => ImageFormat::OpenExr,
+            Self::Avif => ImageFormat::Avif,
         })
     }
 
     /// Saves transparency (the others are flattened on white).
     fn has_alpha(self) -> bool {
-        !matches!(self, Self::Jpeg | Self::Bmp | Self::Pnm | Self::Hdr)
+        !matches!(
+            self,
+            Self::Jpeg | Self::Bmp | Self::Pnm | Self::Hdr | Self::Fits
+        )
     }
 }
 
 /// How a flat image is written.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SaveOptions {
-    /// JPEG quality, 1..=100.
+    /// JPEG and AVIF quality, 1..=100.
     pub quality: u8,
     /// Size factor for flat exports; 1.0 keeps the size.
     pub scale: f32,
@@ -196,11 +248,33 @@ pub fn open_bytes(bytes: &[u8], format: Option<Format>) -> Result<Document> {
         Format::Native => native::read(bytes),
         Format::OpenRaster => ora::read(bytes),
         Format::Psd => psd::read(bytes),
-        _ => {
-            let image = decode(bytes, format.image_format())?.to_rgba8();
-            Ok(Document::from_image(image))
-        }
+        Format::Kra => kra::read(bytes),
+        Format::Pdn => pdn::read(bytes),
+        Format::Svg => svg::read(bytes),
+        Format::Fits => fits::read(bytes),
+        Format::Avif => Err(Error::Format(
+            "AVIF files can be saved but not opened".into(),
+        )),
+        _ => open_flat(bytes, format),
     }
+}
+
+/// A flat image as a one-layer document, with its embedded colour profile.
+fn open_flat(bytes: &[u8], format: Format) -> Result<Document> {
+    let (image, icc) = decode_with_profile(bytes, format.image_format())?;
+    let gray = !image.color().has_color();
+    let mut doc = Document::from_image(image.to_rgba8());
+    if gray {
+        doc.mode = ColorMode::Grayscale;
+    }
+    // Keep the profile only when it describes the pixels as decoded: CMYK arrives as RGB.
+    doc.profile = icc.filter(|icc| profile_fits(icc, gray));
+    Ok(doc)
+}
+
+/// The ICC profile is a valid grey (`gray`) or RGB one.
+fn profile_fits(icc: &[u8], gray: bool) -> bool {
+    Profile::from_icc(icc).is_ok_and(|p| if gray { p.is_gray() } else { p.is_rgb() })
 }
 
 /// Write `doc` to `path`. The file is written aside then renamed, so a failure never
@@ -233,25 +307,110 @@ pub fn encode(doc: &Document, format: Format, options: &SaveOptions) -> Result<V
         Format::Native => native::write(doc),
         Format::OpenRaster => ora::write(doc),
         Format::Psd => psd::write(doc),
-        _ => encode_image(&doc.composite(), format, options),
+        Format::Svg | Format::Kra | Format::Pdn => Err(Error::Format(format!(
+            "{} files cannot be saved",
+            format.label()
+        ))),
+        _ => encode_flat(
+            &doc.composite(),
+            format,
+            options,
+            doc.mode,
+            doc.profile.as_deref(),
+        ),
     }
 }
 
-/// A flat image encoded as `format`, scaled by `options.scale`.
+/// A flat image encoded as `format` in RGB, scaled by `options.scale`.
 pub fn encode_image(image: &RgbaImage, format: Format, options: &SaveOptions) -> Result<Vec<u8>> {
+    encode_flat(image, format, options, ColorMode::Rgb, None)
+}
+
+/// A flat image encoded as `format`: CMYK or grey where the format and `mode` call for it,
+/// with `profile` embedded where it fits the pixels written.
+fn encode_flat(
+    image: &RgbaImage,
+    format: Format,
+    options: &SaveOptions,
+    mode: ColorMode,
+    profile: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let image = scaled(image, options.scale)?;
+    let quality = options.quality.clamp(1, 100);
+    let alpha = options.transparency && format.has_alpha();
+    let (width, height) = image.dimensions();
+    let icc = |gray: bool| {
+        profile
+            .filter(|icc| profile_fits(icc, gray))
+            .map(<[u8]>::to_vec)
+    };
+    let mut out = Cursor::new(Vec::new());
+    let raw = |rgba: bool| {
+        if rgba {
+            (image.as_raw().clone(), ExtendedColorType::Rgba8)
+        } else {
+            (flatten_on_white(&image).into_raw(), ExtendedColorType::Rgb8)
+        }
+    };
+    match (format, mode) {
+        (Format::Fits, _) => {
+            let gray = mode == ColorMode::Grayscale;
+            return Ok(fits::write(&flatten_on_white(&image), gray));
+        }
+        (Format::Jpeg | Format::Tiff, ColorMode::Cmyk) => {
+            return encode_cmyk(&image, format, quality, profile);
+        }
+        (Format::Png | Format::Jpeg | Format::Tiff, ColorMode::Grayscale) => {
+            let (raw, color) = if alpha && format == Format::Png {
+                let raw = image
+                    .pixels()
+                    .flat_map(|p| [luma(p[0], p[1], p[2]), p[3]])
+                    .collect::<Vec<u8>>();
+                (raw, ExtendedColorType::La8)
+            } else {
+                let raw = flatten_on_white(&image)
+                    .pixels()
+                    .map(|p| luma(p[0], p[1], p[2]))
+                    .collect::<Vec<u8>>();
+                (raw, ExtendedColorType::L8)
+            };
+            write_flat(
+                &mut out,
+                format,
+                quality,
+                (&raw, width, height, color),
+                icc(true),
+            )?;
+            return Ok(out.into_inner());
+        }
+        (Format::Png | Format::Jpeg | Format::Tiff, _) => {
+            let (raw, color) = raw(alpha);
+            write_flat(
+                &mut out,
+                format,
+                quality,
+                (&raw, width, height, color),
+                icc(false),
+            )?;
+            return Ok(out.into_inner());
+        }
+        _ => {}
+    }
     let image_format = format
         .image_format()
         .ok_or_else(|| Error::Format(format!("{} is not a flat image format", format.label())))?;
-    let image = scaled(image, options.scale)?;
-    let dynamic = if options.transparency && format.has_alpha() {
+    let dynamic = if alpha {
         DynamicImage::ImageRgba8(image.into_owned())
     } else {
         DynamicImage::ImageRgb8(flatten_on_white(&image))
     };
-    let mut out = Cursor::new(Vec::new());
     match format {
-        Format::Jpeg => JpegEncoder::new_with_quality(&mut out, options.quality.clamp(1, 100))
-            .encode_image(&dynamic)?,
+        Format::Avif => AvifEncoder::new_with_speed_quality(&mut out, 6, quality).write_image(
+            dynamic.as_bytes(),
+            width,
+            height,
+            dynamic.color().into(),
+        )?,
         Format::Hdr => {
             DynamicImage::ImageRgb32F(dynamic.to_rgb32f()).write_to(&mut out, image_format)?
         }
@@ -259,6 +418,103 @@ pub fn encode_image(image: &RgbaImage, format: Format, options: &SaveOptions) ->
             DynamicImage::ImageRgba32F(dynamic.to_rgba32f()).write_to(&mut out, image_format)?
         }
         _ => dynamic.write_to(&mut out, image_format)?,
+    }
+    Ok(out.into_inner())
+}
+
+/// Raw pixels, width, height and their layout.
+type Raw<'a> = (&'a [u8], u32, u32, ExtendedColorType);
+
+/// PNG, JPEG or TIFF through the image crate's encoders, so the profile can go in.
+fn write_flat(
+    out: &mut Cursor<Vec<u8>>,
+    format: Format,
+    quality: u8,
+    pixels: Raw,
+    icc: Option<Vec<u8>>,
+) -> Result<()> {
+    fn with_profile<E: ImageEncoder>(
+        mut encoder: E,
+        pixels: Raw,
+        icc: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if let Some(icc) = icc {
+            // An encoder that cannot hold a profile still writes the pixels.
+            let _ = encoder.set_icc_profile(icc);
+        }
+        let (raw, width, height, color) = pixels;
+        Ok(encoder.write_image(raw, width, height, color)?)
+    }
+    match format {
+        Format::Png => with_profile(PngEncoder::new(out), pixels, icc),
+        Format::Jpeg => with_profile(JpegEncoder::new_with_quality(out, quality), pixels, icc),
+        _ => with_profile(TiffEncoder::new(out), pixels, icc),
+    }
+}
+
+/// The CMYK profile to write with: the document's when it is CMYK, else the generic one.
+fn cmyk_profile(profile: Option<&[u8]>) -> Result<Profile> {
+    let own = profile
+        .and_then(|icc| Profile::from_icc(icc).ok())
+        .filter(Profile::is_cmyk);
+    own.or_else(|| {
+        color::built_in()
+            .into_iter()
+            .find(|(name, _)| *name == "Generic CMYK")
+            .map(|(_, profile)| profile)
+    })
+    .ok_or_else(|| Error::Format("no CMYK profile available".into()))
+}
+
+/// Ink amounts (255 = full ink), four bytes a pixel, of `image` flattened on white.
+fn to_inks(image: &RgbaImage, profile: &Profile) -> Vec<u8> {
+    let flat = flatten_on_white(image);
+    let opaque = RgbaImage::from_fn(image.width(), image.height(), |x, y| {
+        let [r, g, b] = flat.get_pixel(x, y).0;
+        image::Rgba([r, g, b, 255])
+    });
+    color::rgb_to_cmyk(&opaque, &Profile::srgb(), profile, Intent::default()).concat()
+}
+
+/// A CMYK JPEG or TIFF, with its CMYK profile embedded when it has ICC bytes.
+fn encode_cmyk(
+    image: &RgbaImage,
+    format: Format,
+    quality: u8,
+    profile: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let profile = cmyk_profile(profile)?;
+    let inks = to_inks(image, &profile);
+    let icc = profile.icc();
+    let (width, height) = image.dimensions();
+    let mut out = Cursor::new(Vec::new());
+    let failed =
+        |err: &dyn std::fmt::Display| Error::Format(format!("CMYK {}: {err}", format.label()));
+    if format == Format::Jpeg {
+        let side = |v: u32| u16::try_from(v).map_err(|e| failed(&e));
+        let mut encoder = jpeg_encoder::Encoder::new(&mut out, quality);
+        if !icc.is_empty() {
+            encoder.add_icc_profile(&icc).map_err(|e| failed(&e))?;
+        }
+        encoder
+            .encode(
+                &inks,
+                side(width)?,
+                side(height)?,
+                jpeg_encoder::ColorType::Cmyk,
+            )
+            .map_err(|e| failed(&e))?;
+    } else {
+        let mut tiff = tiff::encoder::TiffEncoder::new(&mut out).map_err(|e| failed(&e))?;
+        let mut page = tiff
+            .new_image::<tiff::encoder::colortype::CMYK8>(width, height)
+            .map_err(|e| failed(&e))?;
+        if !icc.is_empty() {
+            page.encoder()
+                .write_tag(tiff::tags::Tag::IccProfile, icc.as_slice())
+                .map_err(|e| failed(&e))?;
+        }
+        page.write_data(&inks).map_err(|e| failed(&e))?;
     }
     Ok(out.into_inner())
 }
@@ -296,14 +552,26 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(b"8BPS") {
         return Some(Format::Psd);
     }
+    if bytes.starts_with(b"PDN3") {
+        return Some(Format::Pdn);
+    }
+    if bytes.starts_with(b"SIMPLE  =") {
+        return Some(Format::Fits);
+    }
     if bytes.starts_with(b"PK\x03\x04") {
-        // OpenRaster stores its mimetype first and uncompressed, right after the 30-byte header.
-        let ora = bytes.get(30..54) == Some(b"mimetypeimage/openraster".as_slice());
-        return Some(if ora {
+        // OpenRaster and KRA store their mimetype first and uncompressed, right after the
+        // 30-byte header.
+        let mimetype = bytes.get(30..).unwrap_or_default();
+        return Some(if mimetype.starts_with(b"mimetypeimage/openraster") {
             Format::OpenRaster
+        } else if mimetype.starts_with(b"mimetypeapplication/x-krita") {
+            Format::Kra
         } else {
             Format::Native
         });
+    }
+    if svg::sniff(bytes) {
+        return Some(Format::Svg);
     }
     let guessed = image::guess_format(bytes).ok()?;
     Format::ALL
@@ -334,6 +602,14 @@ fn check_layers(count: usize, width: u32, height: u32) -> Result<()> {
 
 /// Decode a flat image (`format` None: guessed), refusing oversized ones before allocating.
 fn decode(bytes: &[u8], format: Option<ImageFormat>) -> Result<DynamicImage> {
+    Ok(decode_with_profile(bytes, format)?.0)
+}
+
+/// Like [`decode`], with the ICC profile embedded in the file.
+fn decode_with_profile(
+    bytes: &[u8],
+    format: Option<ImageFormat>,
+) -> Result<(DynamicImage, Option<Vec<u8>>)> {
     let format = match format {
         Some(format) => format,
         None => image::guess_format(bytes)?,
@@ -344,10 +620,19 @@ fn decode(bytes: &[u8], format: Option<ImageFormat>) -> Result<DynamicImage> {
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(MAX_PIXELS * 16);
     reader.limits(limits);
-    let decoder = reader.into_decoder()?;
+    let mut decoder = reader.into_decoder()?;
     let (width, height) = decoder.dimensions();
     check_size(width, height)?;
-    Ok(DynamicImage::from_decoder(decoder)?)
+    // A damaged profile is no reason to refuse the picture.
+    let mut icc = decoder.icc_profile().ok().flatten();
+    if format == ImageFormat::Tiff && icc.is_none() {
+        // The image crate's reader drops the TIFF profile: ask the TIFF decoder itself.
+        icc = tiff::decoder::Decoder::new(Cursor::new(bytes))
+            .and_then(|mut tiff| tiff.get_tag_u8_vec(tiff::tags::Tag::IccProfile))
+            .ok();
+    }
+    let icc = icc.filter(|icc| !icc.is_empty());
+    Ok((DynamicImage::from_decoder(decoder)?, icc))
 }
 
 /// PNG bytes, fast compression (layers are many and big).
@@ -450,7 +735,8 @@ mod tests {
     #[test]
     fn every_flat_format_encodes() {
         let small = RgbaImage::from_pixel(8, 8, Rgba([10, 120, 230, 128]));
-        for format in Format::ALL.into_iter().filter(|f| !f.layered()) {
+        let readable = |f: &Format| f.can_write() && f.can_read() && !f.layered();
+        for format in Format::ALL.into_iter().filter(readable) {
             let bytes = encode_image(&small, format, &SaveOptions::default()).unwrap();
             let back = open_bytes(&bytes, Some(format)).unwrap();
             assert_eq!((back.width, back.height), (8, 8), "{format:?}");
@@ -468,6 +754,104 @@ mod tests {
         assert_eq!(open(&path).unwrap(), doc);
         assert!(!dir.join("doc.gphoto.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_go_in_and_come_back() {
+        let mut doc = Document::from_image(sample());
+        let icc = Profile::srgb().icc();
+        doc.profile = Some(icc.clone());
+        for format in [Format::Png, Format::Jpeg, Format::Tiff] {
+            let bytes = encode(&doc, format, &SaveOptions::default()).unwrap();
+            let back = open_bytes(&bytes, Some(format)).unwrap();
+            assert_eq!(back.profile.as_ref(), Some(&icc), "{format:?}");
+            assert_eq!(back.mode, ColorMode::Rgb);
+        }
+        // A profile that does not fit the pixels stays out.
+        doc.profile = Some(b"not a profile".to_vec());
+        let bytes = encode(&doc, Format::Png, &SaveOptions::default()).unwrap();
+        assert_eq!(open_bytes(&bytes, None).unwrap().profile, None);
+    }
+
+    #[test]
+    fn grayscale_documents_are_written_grey() {
+        let mut doc = Document::from_image(sample());
+        doc.mode = ColorMode::Grayscale;
+        for format in [Format::Png, Format::Jpeg, Format::Tiff] {
+            let bytes = encode(&doc, format, &SaveOptions::default()).unwrap();
+            let image = decode(&bytes, format.image_format()).unwrap();
+            assert!(!image.color().has_color(), "{format:?}");
+            assert_eq!(
+                open_bytes(&bytes, Some(format)).unwrap().mode,
+                ColorMode::Grayscale
+            );
+        }
+    }
+
+    #[test]
+    fn cmyk_documents_are_written_cmyk() {
+        let mut doc = Document::from_image(RgbaImage::from_pixel(8, 8, Rgba([200, 40, 40, 255])));
+        doc.mode = ColorMode::Cmyk;
+        for format in [Format::Jpeg, Format::Tiff] {
+            let bytes = encode(&doc, format, &SaveOptions::default()).unwrap();
+            // The generic CMYK is a formula, with no ICC bytes to embed.
+            assert_eq!(
+                decode_with_profile(&bytes, format.image_format())
+                    .unwrap()
+                    .1,
+                None
+            );
+            if format == Format::Jpeg {
+                // Four components in the frame header.
+                let sof = bytes.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+                assert_eq!(bytes[sof + 9], 4);
+            } else {
+                let mut tiff = tiff::decoder::Decoder::new(Cursor::new(&bytes)).unwrap();
+                assert_eq!(tiff.colortype().unwrap(), tiff::ColorType::CMYK(8));
+            }
+            // Read back as RGB, close to the colour written.
+            let back = open_bytes(&bytes, Some(format)).unwrap();
+            assert_eq!((back.mode, back.profile.as_ref()), (ColorMode::Rgb, None));
+            let pixel = back.composite().get_pixel(4, 4).0;
+            assert!(
+                pixel[0] > 150 && pixel[1] < 110 && pixel[2] < 110,
+                "{format:?} {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn avif_and_fits_are_written() {
+        let small = RgbaImage::from_pixel(16, 16, Rgba([10, 120, 230, 255]));
+        let avif = encode_image(&small, Format::Avif, &SaveOptions::default()).unwrap();
+        assert_eq!(avif.get(4..12), Some(b"ftypavif".as_slice()));
+        let fits = encode_image(&small, Format::Fits, &SaveOptions::default()).unwrap();
+        assert_eq!(sniff(&fits), Some(Format::Fits));
+        assert_eq!(open_bytes(&fits, None).unwrap().composite(), small);
+        assert!(
+            encode(
+                &Document::from_image(small),
+                Format::Svg,
+                &SaveOptions::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn new_formats_are_sniffed() {
+        assert_eq!(sniff(b"PDN3\x10\x00\x00<pdnImage"), Some(Format::Pdn));
+        assert_eq!(
+            sniff(b"\xef\xbb\xbf  <?xml version='1.0'?><svg/>"),
+            Some(Format::Svg)
+        );
+        assert_eq!(sniff(b"<?xml version='1.0'?><html/>"), None);
+        let mut kra = b"PK\x03\x04".to_vec();
+        kra.resize(30, 0);
+        kra.extend_from_slice(b"mimetypeapplication/x-krita");
+        assert_eq!(sniff(&kra), Some(Format::Kra));
+        assert_eq!(Format::from_path(Path::new("a.FITS")), Some(Format::Fits));
+        assert!(!Format::Avif.can_read() && !Format::Kra.can_write());
     }
 
     #[test]

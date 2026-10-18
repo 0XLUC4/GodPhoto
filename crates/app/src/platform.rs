@@ -7,12 +7,13 @@ use godphoto_core::io::Format;
 
 /// Every file GodPhoto opens.
 pub fn pick_images() -> Vec<PathBuf> {
-    let all: Vec<&str> = Format::ALL
-        .iter()
+    let readable = Format::ALL.into_iter().filter(|format| format.can_read());
+    let all: Vec<&str> = readable
+        .clone()
         .flat_map(|format| format.extensions().iter().copied())
         .collect();
     let mut dialog = rfd::FileDialog::new().add_filter("All images", &all);
-    for format in Format::ALL {
+    for format in readable {
         dialog = dialog.add_filter(format.label(), format.extensions());
     }
     dialog.pick_files().unwrap_or_default()

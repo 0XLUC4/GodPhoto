@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::canvas::CanvasState;
 use crate::dialogs::Dialog;
 use crate::doc::DocTab;
+pub use crate::layers::SmartAction;
 use crate::theme::{self, Palette};
 use crate::toasts::Toasts;
 use crate::tools::{GROUPS, Options, Tool};
@@ -42,14 +43,16 @@ pub enum PanelKind {
     Navigator,
     Color,
     Channels,
+    Paths,
     Actions,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 9] = [
+    pub const ALL: [PanelKind; 10] = [
         PanelKind::Properties,
         PanelKind::Layers,
         PanelKind::Channels,
+        PanelKind::Paths,
         PanelKind::History,
         PanelKind::Histogram,
         PanelKind::Info,
@@ -68,6 +71,7 @@ impl PanelKind {
             Self::Navigator => "Navigator",
             Self::Color => "Color",
             Self::Channels => "Channels",
+            Self::Paths => "Paths",
             Self::Actions => "Actions",
         }
     }
@@ -156,8 +160,23 @@ pub enum Cmd {
         color: [u8; 4],
     },
     FreeTransform,
+    TransformAgain,
+    ModeDialog(godphoto_core::ColorMode),
+    SetMode {
+        mode: godphoto_core::ColorMode,
+        colors: usize,
+        dither: bool,
+        flatten: bool,
+    },
+    ProfileDialog {
+        convert: bool,
+    },
+    ToggleProof,
+    ToggleGamut,
+    ProofTarget(usize),
     TurnLayer(Turn),
     DefinePattern,
+    DefineBrush,
     ImageSizeDialog,
     ImageSize {
         width: u32,
@@ -248,6 +267,39 @@ pub enum Cmd {
     ToggleLock,
     Align(Edge),
     SelectLayer(usize),
+    PickLayer {
+        index: usize,
+        range: bool,
+    },
+    ToggleGroupOpen(usize),
+    DropLayer {
+        from: usize,
+        to: usize,
+        into: bool,
+    },
+    SetLabel(u8),
+    LinkLayers,
+    UnlinkLayers,
+    GroupLayers,
+    NewGroup,
+    Ungroup,
+    ConvertToSmart,
+    EditContents,
+    ReplaceContents,
+    PlaceEmbedded,
+    SmartFilter {
+        layer: usize,
+        filter: usize,
+        action: SmartAction,
+    },
+    NewPatternLayer(usize),
+    PathRequest(crate::tools::Request),
+    SelectionToPath,
+    PathMask,
+    Print,
+    ExportPdf,
+    ExportArtboards,
+    ExportSlices,
     ToggleVisible(usize),
     MoveLayer {
         from: usize,
@@ -364,6 +416,13 @@ pub struct GodApp {
     /// A panel edit waiting to become a history step.
     pub pending: Option<String>,
     pub preview: Option<crate::dialogs::Preview>,
+    /// The last Free Transform: (rectangle, where its corners went).
+    pub last_transform: Option<(Rect, [egui::Pos2; 4])>,
+    /// Proof Setup: index among the built-in profiles, and how colours are fitted.
+    pub proof_target: usize,
+    pub proof_on: bool,
+    pub gamut_on: bool,
+    pub intent: godphoto_core::color::Intent,
 }
 
 impl GodApp {
@@ -443,6 +502,14 @@ impl GodApp {
             thumbs: Default::default(),
             pending: None,
             preview: None,
+            last_transform: None,
+            proof_target: godphoto_core::color::built_in()
+                .iter()
+                .position(|(name, _)| *name == "Generic CMYK")
+                .unwrap_or(0),
+            proof_on: false,
+            gamut_on: false,
+            intent: godphoto_core::color::Intent::default(),
             swatches: vec![
                 [0, 0, 0, 255],
                 [255, 255, 255, 255],
@@ -572,7 +639,7 @@ impl GodApp {
     /// Leave what the canvas was doing (a crop, a transform, a path) as it is.
     fn finish_gestures(&mut self) {
         let state = std::mem::take(&mut self.canvas);
-        self.canvas.path = state.path;
+        self.canvas.work = state.work;
         self.canvas.quick_mask = state.quick_mask;
         self.canvas.paint_mask = state.paint_mask;
         self.canvas.clone_source = state.clone_source;
@@ -663,7 +730,7 @@ impl GodApp {
             Cmd::Undo => {
                 if self.canvas.busy() {
                     self.canvas = CanvasState::default();
-                    self.tab().hidden = None;
+                    self.tab().hidden.clear();
                     self.tab().recomposite();
                 } else if !self.tab().undo() {
                     self.toasts.error("Nothing to undo.");
@@ -730,8 +797,98 @@ impl GodApp {
                 });
             }
             Cmd::FreeTransform => self.start_transform(ctx),
+            Cmd::TransformAgain => self.transform_again(),
+            Cmd::ModeDialog(mode) => {
+                use godphoto_core::ColorMode;
+                match mode {
+                    ColorMode::Indexed | ColorMode::Bitmap => {
+                        self.dialog = Some(Dialog::Mode {
+                            mode,
+                            colors: 256,
+                            dither: true,
+                        })
+                    }
+                    _ => self.run(
+                        ctx,
+                        Cmd::SetMode {
+                            mode,
+                            colors: 256,
+                            dither: true,
+                            flatten: false,
+                        },
+                    ),
+                }
+            }
+            Cmd::SetMode {
+                mode,
+                colors,
+                dither,
+                flatten,
+            } => {
+                let cmyk = godphoto_core::color::built_in()
+                    .into_iter()
+                    .nth(self.proof_target)
+                    .map(|(_, p)| p)
+                    .filter(|p| p.is_cmyk());
+                let options = godphoto_core::color::ModeOptions {
+                    colors,
+                    dither,
+                    cmyk,
+                    intent: self.intent,
+                    flatten,
+                };
+                let tab = self.tab();
+                godphoto_core::color::set_mode(&mut tab.doc, mode, &options);
+                tab.active = tab.active.min(tab.doc.layers.len().saturating_sub(1));
+                tab.commit(mode.name());
+            }
+            Cmd::ProfileDialog { convert } => {
+                self.dialog = Some(Dialog::Profile {
+                    convert,
+                    choice: 0,
+                    loaded: None,
+                    bpc: true,
+                })
+            }
+            Cmd::ToggleProof => self.proof_on = !self.proof_on,
+            Cmd::ToggleGamut => self.gamut_on = !self.gamut_on,
+            Cmd::ProofTarget(index) => {
+                self.proof_target = index;
+                self.proof_on = true;
+            }
             Cmd::TurnLayer(turn) => self.turn_layer(turn),
             Cmd::DefinePattern => self.define_pattern(),
+            Cmd::DefineBrush => {
+                let tab = &self.tabs[self.active];
+                let (width, height) = tab.size();
+                let (x, y, w, h) = tab
+                    .selection
+                    .as_ref()
+                    .and_then(select::bounds)
+                    .unwrap_or((0, 0, width, height));
+                if w.max(h) > 2500 {
+                    self.toasts
+                        .error("Select an area of at most 2500 pixels for a brush.");
+                    return;
+                }
+                let mut piece = transform::crop(&tab.composite, x, y, w, h);
+                if let Some(mask) = &tab.selection {
+                    let mask = transform::crop_gray(mask, x, y, w, h);
+                    godphoto_core::apply_mask(&mut piece, &mask);
+                }
+                let tip = godphoto_core::paint::Tip::from_image(&piece);
+                let name = format!("Brush {}", self.options.brushes.len() + 1);
+                let brush = godphoto_core::paint::Brush {
+                    size: w.max(h) as f32,
+                    tip: Some(tip),
+                    spacing: 0.25,
+                    ..self.options.brush.clone()
+                };
+                self.options.brushes.push((name.clone(), brush.clone()));
+                self.options.brush = brush;
+                self.toasts
+                    .success(format!("{name} defined: it is in the brush presets."));
+            }
             Cmd::ImageSizeDialog => self.dialog = Some(Dialog::image_size(&self.tabs[self.active])),
             Cmd::ImageSize {
                 width,
@@ -878,24 +1035,47 @@ impl GodApp {
                     "New Layer",
                 );
             }
-            Cmd::DuplicateLayer => {
-                let tab = self.tab();
-                let Some(mut layer) = tab.layer().cloned() else {
+            Cmd::DuplicateLayer => self.duplicate_layers(),
+            Cmd::DeleteLayer => self.delete_layers(),
+            Cmd::PickLayer { index, range } => self.pick_layer(index, range),
+            Cmd::ToggleGroupOpen(index) => self.toggle_group_open(index),
+            Cmd::DropLayer { from, to, into } => self.drop_layer(from, to, into),
+            Cmd::SetLabel(label) => self.set_label(label),
+            Cmd::LinkLayers => self.link_layers(true),
+            Cmd::UnlinkLayers => self.link_layers(false),
+            Cmd::GroupLayers => self.group_layers(),
+            Cmd::NewGroup => self.new_group(),
+            Cmd::Ungroup => self.ungroup(),
+            Cmd::ConvertToSmart => self.convert_to_smart(),
+            Cmd::EditContents => self.edit_contents(),
+            Cmd::ReplaceContents => self.replace_contents(),
+            Cmd::PlaceEmbedded => self.place_embedded(),
+            Cmd::SmartFilter {
+                layer,
+                filter,
+                action,
+            } => self.smart_filter(layer, filter, action),
+            Cmd::PathRequest(request) => self.request(ctx, request),
+            Cmd::SelectionToPath => self.selection_to_path(),
+            Cmd::PathMask => self.path_mask(),
+            Cmd::Print => self.print_image(),
+            Cmd::ExportPdf => self.export_pdf(),
+            Cmd::ExportArtboards => self.export_parts(true),
+            Cmd::ExportSlices => self.export_parts(false),
+            Cmd::NewPatternLayer(index) => {
+                let Some((_, pattern)) = self.patterns.get(index).cloned() else {
                     return;
                 };
-                layer.name = format!("{} copy", layer.name);
-                self.add_layer(layer, "Duplicate Layer");
-            }
-            Cmd::DeleteLayer => {
-                let tab = self.tab();
-                if tab.doc.layers.len() <= 1 {
-                    self.toasts.error("An image keeps at least one layer.");
-                    return;
-                }
-                let index = tab.active;
-                tab.doc.layers.remove(index);
-                tab.active = index.saturating_sub(1);
-                tab.commit("Delete Layer");
+                let name = self.layer_name("Pattern Fill");
+                let mut layer = Layer::new(
+                    name,
+                    Content::Pattern {
+                        pattern,
+                        scale: 1.0,
+                    },
+                );
+                layer.mask = self.tab().selection.clone();
+                self.add_layer(layer, "New Fill Layer");
             }
             Cmd::NewFillLayer(color) => {
                 let mut layer = Layer::new(self.layer_name("Color Fill"), Content::Fill(color));
@@ -992,17 +1172,7 @@ impl GodApp {
                 }
                 self.edit_layer("Clipping Mask", |layer| layer.clipped = !layer.clipped);
             }
-            Cmd::Arrange(arrange) => {
-                let tab = self.tab();
-                let (from, last) = (tab.active, tab.doc.layers.len() - 1);
-                let to = match arrange {
-                    Arrange::Front => last,
-                    Arrange::Forward => (from + 1).min(last),
-                    Arrange::Backward => from.saturating_sub(1),
-                    Arrange::Back => 0,
-                };
-                self.run(ctx, Cmd::MoveLayer { from, to });
-            }
+            Cmd::Arrange(arrange) => self.arrange(arrange),
             Cmd::MoveLayer { from, to } => {
                 let tab = self.tab();
                 if from == to || from >= tab.doc.layers.len() || to >= tab.doc.layers.len() {
@@ -1052,17 +1222,7 @@ impl GodApp {
             }
             Cmd::ToggleLock => self.edit_layer("Lock Layer", |layer| layer.locked = !layer.locked),
             Cmd::Align(edge) => self.align_layer(edge),
-            Cmd::SelectLayer(index) => {
-                let tab = self.tab();
-                if index < tab.doc.layers.len() {
-                    if let Some(editing) = self.canvas.editing_text.take() {
-                        self.end_text(editing);
-                    }
-                    let tab = self.tab();
-                    tab.active = index;
-                    self.canvas.paint_mask = false;
-                }
-            }
+            Cmd::SelectLayer(index) => self.select_layer(index),
             Cmd::ToggleVisible(index) => {
                 let tab = self.tab();
                 if let Some(layer) = tab.doc.layers.get_mut(index) {
@@ -1214,11 +1374,7 @@ impl GodApp {
             }
             Cmd::QuickMask => self.toggle_quick_mask(),
             Cmd::FilterDialog(filter) => self.open_effect(crate::dialogs::Effect::Filter(filter)),
-            Cmd::ApplyFilter(filter) => {
-                let name = filter.name().to_owned();
-                self.last_filter = Some(filter.clone());
-                self.on_pixels(&name, |image, _| *image = filter.apply(image));
-            }
+            Cmd::ApplyFilter(filter) => self.apply_filter(filter),
             Cmd::LastFilter => match self.last_filter.clone() {
                 Some(filter) => self.run(ctx, Cmd::ApplyFilter(filter)),
                 None => self.toasts.error("No filter has been used yet."),
@@ -1308,7 +1464,7 @@ impl GodApp {
 
     // ------------------------------------------------------------ document operations
 
-    fn layer_name(&mut self, base: &str) -> String {
+    pub fn layer_name(&mut self, base: &str) -> String {
         let tab = self.tab();
         let mut number = 1;
         loop {
@@ -1377,9 +1533,9 @@ impl GodApp {
             self.toasts.error("The layer is locked.");
             return;
         }
-        if layer.is_adjustment() {
+        if layer.is_adjustment() || layer.content.is_group() {
             self.toasts
-                .error("Pick a layer with pixels: this one is an adjustment.");
+                .error("Pick a layer with pixels: this one is an adjustment or a group.");
             return;
         }
         if !matches!(layer.content, Content::Pixels(_)) {
@@ -1777,28 +1933,19 @@ impl GodApp {
     }
 
     /// Move the active layer by whole pixels.
+    /// Move the active layer (with its group and linked layers) by whole pixels.
     pub fn shift_layer(&mut self, dx: i32, dy: i32, step: &str) {
-        if dx == 0 && dy == 0 {
-            return;
-        }
-        self.edit_layer(step, |layer| {
-            match &mut layer.content {
-                Content::Pixels(image) => *image = transform::shift(image, dx, dy),
-                Content::Text(text) => {
-                    text.x += dx as f32;
-                    text.y += dy as f32;
-                }
-                Content::Gradient(gradient) => {
-                    gradient.start = (gradient.start.0 + dx as f32, gradient.start.1 + dy as f32);
-                    gradient.end = (gradient.end.0 + dx as f32, gradient.end.1 + dy as f32);
-                }
-                _ => {}
-            }
-            if let Some(mask) = &mut layer.mask {
-                let as_rgba = gray_to_rgba(mask);
-                *mask = rgba_to_gray(&transform::shift(&as_rgba, dx, dy));
-            }
-        });
+        self.shift_targets(dx, dy, step);
+    }
+
+    /// Open `doc` in a new tab named `name`.
+    pub fn open_document(&mut self, name: String, doc: Document, step: &str) {
+        self.next_id += 1;
+        let tab = DocTab::new(self.next_id, name, None, doc, step);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.home = false;
+        self.canvas = CanvasState::default();
     }
 
     fn load_lookup(&mut self) {
@@ -1884,6 +2031,9 @@ impl GodApp {
             (shift, Key::S, Cmd::SaveAs),
             (shift, Key::Z, Cmd::Redo),
             (shift, Key::N, Cmd::NewLayer),
+            (shift, Key::G, Cmd::Ungroup),
+            (shift, Key::T, Cmd::TransformAgain),
+            (shift, Key::Y, Cmd::ToggleGamut),
             (shift, Key::D, Cmd::Reselect),
             (shift, Key::I, Cmd::Inverse),
             (shift, Key::J, Cmd::LayerViaCut),
@@ -1909,7 +2059,7 @@ impl GodApp {
             (ctrl, Key::S, Cmd::Save),
             (ctrl, Key::W, Cmd::CloseTab),
             (ctrl, Key::Z, Cmd::Undo),
-            (ctrl, Key::Y, Cmd::Redo),
+            (ctrl, Key::Y, Cmd::ToggleProof),
             (ctrl, Key::A, Cmd::SelectAll),
             (ctrl, Key::D, Cmd::Deselect),
             (ctrl, Key::J, Cmd::LayerViaCopy),
@@ -1920,7 +2070,9 @@ impl GodApp {
             (ctrl, Key::U, Cmd::AdjustDialog("Hue/Saturation".into())),
             (ctrl, Key::B, Cmd::AdjustDialog("Color Balance".into())),
             (ctrl, Key::I, Cmd::AdjustDialog("Invert".into())),
-            (ctrl, Key::G, Cmd::ToggleGrid),
+            (ctrl, Key::G, Cmd::GroupLayers),
+            (ctrl, Key::Quote, Cmd::ToggleGrid),
+            (ctrl, Key::P, Cmd::Print),
             (ctrl, Key::Semicolon, Cmd::ToggleGuides),
             (ctrl, Key::H, Cmd::ToggleExtras),
             (ctrl, Key::Num0, Cmd::Fit),
@@ -2199,6 +2351,7 @@ impl GodApp {
                         );
                     }
                 });
+                item(ui, clicked, "Place Embedded…", "", Cmd::PlaceEmbedded);
                 ui.separator();
                 item(ui, clicked, "Close", "Ctrl+W", Cmd::CloseTab);
                 item(ui, clicked, "Save", "Ctrl+S", Cmd::Save);
@@ -2207,8 +2360,14 @@ impl GodApp {
                 ui.menu_button("Export", |ui| {
                     item(ui, clicked, "Quick Export as PNG", "", Cmd::QuickExport);
                     item(ui, clicked, "Export As…", "Ctrl+Shift+Alt+S", Cmd::ExportAs);
+                    item(ui, clicked, "PDF…", "", Cmd::ExportPdf);
+                    ui.separator();
+                    item(ui, clicked, "Artboards to Files…", "", Cmd::ExportArtboards);
+                    item(ui, clicked, "Slices to Files…", "", Cmd::ExportSlices);
                 });
                 item(ui, clicked, "Duplicate Image", "", Cmd::DuplicateImage);
+                ui.separator();
+                item(ui, clicked, "Print…", "Ctrl+P", Cmd::Print);
                 ui.separator();
                 item(ui, clicked, "Options…", "", Cmd::Preferences);
                 item(ui, clicked, "Exit", "", Cmd::Quit);
@@ -2254,6 +2413,8 @@ impl GodApp {
                 ui.separator();
                 item(ui, clicked, "Free Transform", "Ctrl+T", Cmd::FreeTransform);
                 ui.menu_button("Transform", |ui| {
+                    item(ui, clicked, "Again", "Ctrl+Shift+T", Cmd::TransformAgain);
+                    ui.separator();
                     item(ui, clicked, "Rotate 180°", "", Cmd::TurnLayer(Turn::Half));
                     item(
                         ui,
@@ -2286,7 +2447,23 @@ impl GodApp {
                     );
                 });
                 ui.separator();
+                item(ui, clicked, "Define Brush Preset…", "", Cmd::DefineBrush);
                 item(ui, clicked, "Define Pattern…", "", Cmd::DefinePattern);
+                ui.separator();
+                item(
+                    ui,
+                    clicked,
+                    "Assign Profile…",
+                    "",
+                    Cmd::ProfileDialog { convert: false },
+                );
+                item(
+                    ui,
+                    clicked,
+                    "Convert to Profile…",
+                    "",
+                    Cmd::ProfileDialog { convert: true },
+                );
                 ui.separator();
                 item(
                     ui,
@@ -2298,7 +2475,10 @@ impl GodApp {
             });
             ui.menu_button("Image", |ui| {
                 ui.menu_button("Mode", |ui| {
-                    item(ui, clicked, "Grayscale", "", Cmd::Grayscale);
+                    for mode in godphoto_core::ColorMode::ALL {
+                        let on = tab.doc.mode == mode;
+                        check(ui, clicked, mode.name(), "", on, Cmd::ModeDialog(mode));
+                    }
                 });
                 ui.separator();
                 ui.menu_button("Adjustments", |ui| {
@@ -2400,6 +2580,15 @@ impl GodApp {
             ui.menu_button("Layer", |ui| {
                 ui.menu_button("New", |ui| {
                     item(ui, clicked, "Layer…", "Ctrl+Shift+N", Cmd::NewLayer);
+                    item(ui, clicked, "Group", "", Cmd::NewGroup);
+                    item(ui, clicked, "Group from Layers", "Ctrl+G", Cmd::GroupLayers);
+                    item(
+                        ui,
+                        clicked,
+                        "Artboard (Artboard tool)",
+                        "",
+                        Cmd::PickTool(Tool::Artboard),
+                    );
                     item(ui, clicked, "Layer via Copy", "Ctrl+J", Cmd::LayerViaCopy);
                     item(
                         ui,
@@ -2423,6 +2612,7 @@ impl GodApp {
                 ui.menu_button("New Fill Layer", |ui| {
                     item(ui, clicked, "Solid Color…", "", Cmd::NewFillLayer(self.fg));
                     item(ui, clicked, "Gradient…", "", Cmd::NewGradientLayer);
+                    item(ui, clicked, "Pattern…", "", Cmd::NewPatternLayer(0));
                 });
                 ui.menu_button("New Adjustment Layer", |ui| {
                     for name in Adjustment::KINDS {
@@ -2463,6 +2653,21 @@ impl GodApp {
                         "",
                         Cmd::ToggleMask,
                     );
+                });
+                ui.menu_button("Vector Mask", |ui| {
+                    item(ui, clicked, "Current Path", "", Cmd::PathMask);
+                });
+                ui.menu_button("Smart Objects", |ui| {
+                    item(
+                        ui,
+                        clicked,
+                        "Convert to Smart Object",
+                        "",
+                        Cmd::ConvertToSmart,
+                    );
+                    item(ui, clicked, "Edit Contents", "", Cmd::EditContents);
+                    item(ui, clicked, "Replace Contents…", "", Cmd::ReplaceContents);
+                    item(ui, clicked, "Rasterize", "", Cmd::Rasterize);
                 });
                 let clipped = layer.is_some_and(|layer| layer.clipped);
                 let label = if clipped {
@@ -2525,6 +2730,10 @@ impl GodApp {
                     );
                     item(ui, clicked, "Right Edges", "", Cmd::Align(Edge::Right));
                 });
+                item(ui, clicked, "Group Layers", "Ctrl+G", Cmd::GroupLayers);
+                item(ui, clicked, "Ungroup Layers", "Ctrl+Shift+G", Cmd::Ungroup);
+                item(ui, clicked, "Link Layers", "", Cmd::LinkLayers);
+                item(ui, clicked, "Unlink Layers", "", Cmd::UnlinkLayers);
                 let locked = layer.is_some_and(|layer| layer.locked);
                 item(
                     ui,
@@ -2635,6 +2844,7 @@ impl GodApp {
                     }
                 });
                 item(ui, clicked, "Save Selection", "", Cmd::SaveSelection);
+                item(ui, clicked, "Make Work Path", "", Cmd::SelectionToPath);
             });
             ui.menu_button("Filter", |ui| {
                 let last = self
@@ -2672,6 +2882,29 @@ impl GodApp {
                 item(ui, clicked, "100%", "Ctrl+1", Cmd::ActualPixels);
                 item(ui, clicked, "Reset View Rotation", "", Cmd::ResetRotation);
                 ui.separator();
+                ui.menu_button("Proof Setup", |ui| {
+                    for (index, (name, _)) in godphoto_core::color::built_in().iter().enumerate() {
+                        let on = self.proof_target == index;
+                        check(ui, clicked, name, "", on, Cmd::ProofTarget(index));
+                    }
+                });
+                check(
+                    ui,
+                    clicked,
+                    "Proof Colors",
+                    "Ctrl+Y",
+                    self.proof_on,
+                    Cmd::ToggleProof,
+                );
+                check(
+                    ui,
+                    clicked,
+                    "Gamut Warning",
+                    "Ctrl+Shift+Y",
+                    self.gamut_on,
+                    Cmd::ToggleGamut,
+                );
+                ui.separator();
                 check(
                     ui,
                     clicked,
@@ -2681,7 +2914,7 @@ impl GodApp {
                     Cmd::ToggleExtras,
                 );
                 ui.menu_button("Show", |ui| {
-                    check(ui, clicked, "Grid", "Ctrl+G", self.grid, Cmd::ToggleGrid);
+                    check(ui, clicked, "Grid", "Ctrl+'", self.grid, Cmd::ToggleGrid);
                     check(
                         ui,
                         clicked,
@@ -3096,6 +3329,7 @@ impl eframe::App for GodApp {
             self.run(&ctx, cmd);
         }
         if self.has_tab() {
+            self.sync_smart_children();
             self.poll_jobs(&ctx);
             self.flush_pending(&ctx);
         }
@@ -3298,6 +3532,28 @@ fn palette_entries() -> Vec<(String, Cmd)> {
         ("Record Action", Cmd::RecordAction),
         ("Preferences", Cmd::Preferences),
         ("Toggle Dark Mode", Cmd::ToggleTheme),
+        ("Place Embedded", Cmd::PlaceEmbedded),
+        ("Print", Cmd::Print),
+        ("Export as PDF", Cmd::ExportPdf),
+        ("Export Artboards to Files", Cmd::ExportArtboards),
+        ("Export Slices to Files", Cmd::ExportSlices),
+        ("Transform Again", Cmd::TransformAgain),
+        ("Define Brush Preset", Cmd::DefineBrush),
+        ("New Group", Cmd::NewGroup),
+        ("Group Layers", Cmd::GroupLayers),
+        ("Ungroup Layers", Cmd::Ungroup),
+        ("Link Layers", Cmd::LinkLayers),
+        ("Unlink Layers", Cmd::UnlinkLayers),
+        ("Convert to Smart Object", Cmd::ConvertToSmart),
+        ("Edit Contents", Cmd::EditContents),
+        ("Replace Contents", Cmd::ReplaceContents),
+        ("New Pattern Fill Layer", Cmd::NewPatternLayer(0)),
+        ("Vector Mask from Path", Cmd::PathMask),
+        ("Make Work Path from Selection", Cmd::SelectionToPath),
+        ("Assign Profile", Cmd::ProfileDialog { convert: false }),
+        ("Convert to Profile", Cmd::ProfileDialog { convert: true }),
+        ("Proof Colors", Cmd::ToggleProof),
+        ("Gamut Warning", Cmd::ToggleGamut),
     ]
     .into_iter()
     .map(|(name, cmd)| (name.to_owned(), cmd))
@@ -3327,6 +3583,9 @@ fn palette_entries() -> Vec<(String, Cmd)> {
     }
     for kind in PanelKind::ALL {
         entries.push((format!("Panel: {}", kind.name()), Cmd::TogglePanel(kind)));
+    }
+    for mode in godphoto_core::ColorMode::ALL {
+        entries.push((format!("Mode: {}", mode.name()), Cmd::ModeDialog(mode)));
     }
     entries
 }
@@ -3397,6 +3656,7 @@ pub fn panel_glyph(kind: PanelKind) -> &'static str {
         PanelKind::Navigator => icon::NAVIGATION_ARROW,
         PanelKind::Color => icon::PALETTE,
         PanelKind::Channels => icon::CIRCLES_THREE,
+        PanelKind::Paths => icon::BEZIER_CURVE,
         PanelKind::Actions => icon::PLAY,
     }
 }

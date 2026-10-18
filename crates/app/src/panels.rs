@@ -11,7 +11,7 @@ use godphoto_core::adjust::{self, Levels};
 use godphoto_core::filter::Param;
 use godphoto_core::{Adjustment, Content, Layer, transform};
 
-use crate::app::{Cmd, GodApp, PanelKind, panel_glyph, to_color};
+use crate::app::{Cmd, GodApp, PanelKind, SmartAction, panel_glyph, to_color};
 use crate::theme::Palette;
 use crate::widgets::{self, icon};
 
@@ -22,6 +22,55 @@ pub struct Thumbs {
     histogram: Option<(HistogramKey, [[u32; 256]; 4])>,
     pub channel: usize,
     pub curve_channel: usize,
+    /// Layers panel: kind of layer shown (0 = all) and words to find.
+    pub kind: usize,
+    pub search: String,
+}
+
+const LABELS: [&str; 8] = [
+    "None", "Red", "Orange", "Yellow", "Green", "Blue", "Violet", "Gray",
+];
+
+const KINDS: [&str; 7] = [
+    "All",
+    "Pixel",
+    "Adjustment",
+    "Type",
+    "Shape",
+    "Smart object",
+    "Group",
+];
+
+fn kind_matches(kind: usize, content: &Content) -> bool {
+    match kind {
+        1 => matches!(content, Content::Pixels(_)),
+        2 => matches!(
+            content,
+            Content::Adjustment(_)
+                | Content::Fill(_)
+                | Content::Gradient(_)
+                | Content::Pattern { .. }
+        ),
+        3 => matches!(content, Content::Text(_)),
+        4 => matches!(content, Content::Shape(_)),
+        5 => matches!(content, Content::Smart(_)),
+        6 => matches!(content, Content::Group(_)),
+        _ => true,
+    }
+}
+
+/// The colour of a layer's colour tag.
+pub fn label_color(label: u8, none: Color32) -> Color32 {
+    match label {
+        1 => Color32::from_rgb(230, 70, 70),
+        2 => Color32::from_rgb(240, 150, 50),
+        3 => Color32::from_rgb(235, 210, 60),
+        4 => Color32::from_rgb(90, 190, 90),
+        5 => Color32::from_rgb(80, 140, 235),
+        6 => Color32::from_rgb(170, 110, 220),
+        7 => Color32::from_rgb(150, 150, 150),
+        _ => none,
+    }
 }
 
 const THUMB: f32 = 36.0;
@@ -45,6 +94,7 @@ impl GodApp {
                         PanelKind::Properties => self.properties(ui, clicked),
                         PanelKind::Layers => self.layers_panel(ui, clicked),
                         PanelKind::Channels => self.channels(ui, clicked),
+                        PanelKind::Paths => self.paths_panel(ui, clicked),
                         PanelKind::History => self.history(ui, clicked),
                         PanelKind::Histogram => self.histogram(ui),
                         PanelKind::Info => self.info(ui),
@@ -69,9 +119,19 @@ impl GodApp {
         };
         let (mut opacity, mut fill, mut blend) =
             (layer.opacity * 100.0, layer.fill * 100.0, layer.blend);
+        let mut pass_through = match &layer.content {
+            Content::Group(group) => Some(group.pass_through),
+            _ => None,
+        };
         let mut changed = false;
         ui.horizontal(|ui| {
-            changed |= crate::tools::blend_combo(ui, "layer-blend", &mut blend);
+            if let Some(pass) = &mut pass_through {
+                // A group can let its layers blend with what is under it.
+                changed |= ui.toggle_value(pass, "Pass Through").changed();
+            }
+            if pass_through != Some(true) {
+                changed |= crate::tools::blend_combo(ui, "layer-blend", &mut blend);
+            }
             ui.label("Opacity");
             changed |= ui
                 .add(
@@ -90,7 +150,17 @@ impl GodApp {
             if widgets::small_icon_button(ui, lock, "Lock the layer").clicked() {
                 clicked.push(Cmd::ToggleLock);
             }
-            ui.add_space(ui.available_width() - 150.0);
+            let label = widgets::small_icon_button(ui, icon::TAG, "Color label");
+            egui::Popup::menu(&label).show(|ui| {
+                for (index, name) in LABELS.iter().enumerate() {
+                    let text = RichText::new(format!("●  {name}"))
+                        .color(label_color(index as u8, palette.text_dim));
+                    if ui.button(text).clicked() {
+                        clicked.push(Cmd::SetLabel(index as u8));
+                    }
+                }
+            });
+            ui.add_space((ui.available_width() - 150.0).max(0.0));
             ui.label("Fill");
             changed |= ui
                 .add(
@@ -106,39 +176,83 @@ impl GodApp {
                 layer.opacity = opacity / 100.0;
                 layer.fill = fill / 100.0;
                 layer.blend = blend;
+                if let (Content::Group(group), Some(pass)) = (&mut layer.content, pass_through) {
+                    group.pass_through = pass;
+                }
                 tab.recomposite();
                 self.pending = Some("Layer Settings".to_owned());
             }
         }
+        // Show only some kinds of layers, or those whose name has some words.
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("layer-kind")
+                .width(90.0)
+                .selected_text(KINDS[self.thumbs.kind])
+                .show_ui(ui, |ui| {
+                    for (index, name) in KINDS.iter().enumerate() {
+                        ui.selectable_value(&mut self.thumbs.kind, index, *name);
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.thumbs.search)
+                    .hint_text("Find a layer")
+                    .desired_width(f32::INFINITY),
+            );
+        });
         ui.add_space(4.0);
-        let tab_id = self.tabs[self.active].id;
-        let count = self.tabs[self.active].doc.layers.len();
-        let version = (
-            self.tabs[self.active].at,
-            self.tabs[self.active].history.len(),
-        );
-        for index in (0..count).rev() {
-            self.layer_row(ui, &palette, index, tab_id, version, clicked);
+        let tab = &self.tabs[self.active];
+        let tab_id = tab.id;
+        let version = (tab.at, tab.history.len());
+        let filtering = self.thumbs.kind != 0 || !self.thumbs.search.trim().is_empty();
+        let rows: Vec<usize> = (0..tab.doc.layers.len())
+            .rev()
+            .filter(|index| {
+                let layer = &tab.doc.layers[*index];
+                if matches!(layer.content, Content::GroupEnd) {
+                    return false;
+                }
+                if filtering {
+                    return kind_matches(self.thumbs.kind, &layer.content)
+                        && layer.name.to_lowercase().contains(&self.thumbs.search.trim().to_lowercase());
+                }
+                // Inside a closed group: hidden.
+                let mut at = *index;
+                while let Some(parent) = tab.doc.parent(at) {
+                    if matches!(&tab.doc.layers[parent].content, Content::Group(group) if !group.open) {
+                        return false;
+                    }
+                    at = parent;
+                }
+                true
+            })
+            .collect();
+        for index in rows {
+            let depth = if filtering {
+                0
+            } else {
+                self.tabs[self.active].doc.depth(index)
+            };
+            self.layer_row(ui, &palette, index, depth, tab_id, version, clicked);
+            self.smart_filter_rows(ui, &palette, index, depth, clicked);
         }
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let buttons = [
-                (icon::PLUS, "New layer (Ctrl+Shift+N)", Cmd::NewLayer),
+                (
+                    icon::LINK_SIMPLE,
+                    "Link the selected layers",
+                    Cmd::LinkLayers,
+                ),
                 (icon::SPARKLE, "Layer style", Cmd::LayerStyleDialog),
                 (icon::CIRCLE_HALF, "Add a layer mask", Cmd::MaskReveal),
-                (icon::LINK, "Clipping mask", Cmd::ClippingMask),
+                (
+                    icon::FOLDER_SIMPLE_PLUS,
+                    "Group the selected layers (Ctrl+G)",
+                    Cmd::GroupLayers,
+                ),
+                (icon::PLUS, "New layer (Ctrl+Shift+N)", Cmd::NewLayer),
                 (icon::COPY, "Duplicate layer", Cmd::DuplicateLayer),
-                (
-                    icon::ARROW_UP,
-                    "Bring forward",
-                    Cmd::Arrange(crate::app::Arrange::Forward),
-                ),
-                (
-                    icon::ARROW_DOWN,
-                    "Send backward",
-                    Cmd::Arrange(crate::app::Arrange::Backward),
-                ),
                 (icon::TRASH, "Delete layer", Cmd::DeleteLayer),
             ];
             for (glyph, tip, cmd) in buttons {
@@ -146,32 +260,40 @@ impl GodApp {
                     clicked.push(cmd);
                 }
             }
-            let adjust =
-                widgets::small_icon_button(ui, icon::SLIDERS_HORIZONTAL, "New adjustment layer");
+            let adjust = widgets::small_icon_button(
+                ui,
+                icon::SLIDERS_HORIZONTAL,
+                "New fill or adjustment layer",
+            );
             egui::Popup::menu(&adjust).show(|ui| {
+                if ui.button("Solid Color…").clicked() {
+                    clicked.push(Cmd::NewFillLayer(self.fg));
+                }
+                if ui.button("Gradient…").clicked() {
+                    clicked.push(Cmd::NewGradientLayer);
+                }
+                if ui.button("Pattern…").clicked() {
+                    clicked.push(Cmd::NewPatternLayer(0));
+                }
+                ui.separator();
                 for name in Adjustment::KINDS {
-                    if ui.button(name).clicked()
+                    if ui.button(format!("{name}…")).clicked()
                         && let Some(adjustment) = Adjustment::default_of(name)
                     {
                         clicked.push(Cmd::NewAdjustmentLayer(adjustment));
                     }
                 }
-                ui.separator();
-                if ui.button("Solid Color").clicked() {
-                    clicked.push(Cmd::NewFillLayer(self.fg));
-                }
-                if ui.button("Gradient").clicked() {
-                    clicked.push(Cmd::NewGradientLayer);
-                }
             });
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layer_row(
         &mut self,
         ui: &mut Ui,
         palette: &Palette,
         index: usize,
+        depth: usize,
         tab_id: u64,
         version: (usize, usize),
         clicked: &mut Vec<Cmd>,
@@ -180,15 +302,51 @@ impl GodApp {
         let tab = &self.tabs[self.active];
         let layer = &tab.doc.layers[index];
         let active = index == tab.active;
+        let picked = active || tab.picked.contains(&index);
         let painting_mask = active && self.canvas.paint_mask;
+        let height = if layer.content.is_group() {
+            28.0
+        } else {
+            THUMB + 8.0
+        };
         let (rect, response) =
-            ui.allocate_exact_size(vec2(ui.available_width(), THUMB + 8.0), Sense::click());
-        if active {
+            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
+        if picked {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(6), palette.selected);
         } else if response.hovered() {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(6), palette.hover);
+        }
+        if layer.label > 0 {
+            let strip = Rect::from_min_size(rect.min, vec2(4.0, rect.height()));
+            ui.painter().rect_filled(
+                strip,
+                CornerRadius::same(2),
+                label_color(layer.label, palette.text_dim),
+            );
+        }
+        // Dragging a row moves the layer (and its group) to where it is dropped.
+        response.dnd_set_drag_payload(index);
+        if let Some(from) = response.dnd_hover_payload::<usize>()
+            && *from != index
+        {
+            let into =
+                matches!(layer.content, Content::Group(_)) && ui.input(|input| input.modifiers.alt);
+            let y = if into { rect.center().y } else { rect.min.y };
+            ui.painter()
+                .hline(rect.x_range(), y, Stroke::new(2.0, palette.accent));
+        }
+        if let Some(from) = response.dnd_release_payload::<usize>()
+            && *from != index
+        {
+            let into =
+                matches!(layer.content, Content::Group(_)) && ui.input(|input| input.modifiers.alt);
+            clicked.push(Cmd::DropLayer {
+                from: *from,
+                to: index,
+                into,
+            });
         }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -204,66 +362,110 @@ impl GodApp {
         if widgets::small_icon_button(&mut child, eye, "Show / hide").clicked() {
             clicked.push(Cmd::ToggleVisible(index));
         }
+        child.add_space(depth as f32 * 14.0);
         if layer.clipped {
             child.label(RichText::new(icon::ARROW_ELBOW_DOWN_RIGHT).color(palette.text_dim));
         }
-        let glyph = match &layer.content {
-            Content::Adjustment(_) => Some(icon::CIRCLE_HALF),
-            Content::Text(_) => Some(icon::TEXT_T),
-            Content::Fill(_) => Some(icon::DROP),
-            Content::Gradient(_) => Some(icon::GRADIENT),
-            Content::Pixels(_) => None,
-        };
-        let picture = match (glyph, &thumb) {
-            (Some(glyph), _) if !matches!(layer.content, Content::Text(_)) => {
-                let (r, response) = child.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
-                child
-                    .painter()
-                    .rect_filled(r, CornerRadius::same(4), palette.surface);
+        if let Content::Group(group) = &layer.content {
+            let arrow = if group.open {
+                icon::CARET_DOWN
+            } else {
+                icon::CARET_RIGHT
+            };
+            if widgets::small_icon_button(&mut child, arrow, "Open / close the group").clicked() {
+                clicked.push(Cmd::ToggleGroupOpen(index));
+            }
+            let glyph = if group.artboard.is_some() {
+                icon::FRAME_CORNERS
+            } else {
+                icon::FOLDER_SIMPLE
+            };
+            child.label(RichText::new(glyph).size(18.0));
+        } else {
+            let glyph = match &layer.content {
+                Content::Adjustment(_) => Some(icon::CIRCLE_HALF),
+                Content::Fill(_) => Some(icon::DROP),
+                Content::Gradient(_) => Some(icon::GRADIENT),
+                Content::Pattern { .. } => Some(icon::GRID_FOUR),
+                _ => None,
+            };
+            let picture = match (glyph, &thumb) {
+                (Some(glyph), _) => {
+                    let (r, response) =
+                        child.allocate_exact_size(vec2(THUMB, THUMB), Sense::click());
+                    child
+                        .painter()
+                        .rect_filled(r, CornerRadius::same(4), palette.surface);
+                    child.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyph,
+                        egui::FontId::proportional(20.0),
+                        palette.text,
+                    );
+                    response
+                }
+                (_, Some(texture)) => child.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(vec2(THUMB, THUMB))
+                        .sense(Sense::click()),
+                ),
+                _ => {
+                    child
+                        .allocate_exact_size(vec2(THUMB, THUMB), Sense::click())
+                        .1
+                }
+            };
+            // A badge says what kind of layer the picture is.
+            let badge = match &layer.content {
+                Content::Text(_) => Some(icon::TEXT_T),
+                Content::Shape(_) => Some(icon::BEZIER_CURVE),
+                Content::Smart(_) => Some(icon::FILE_IMAGE),
+                _ => None,
+            };
+            if let Some(badge) = badge {
+                let corner = picture.rect.right_bottom() - vec2(7.0, 7.0);
+                child.painter().circle_filled(corner, 7.0, palette.surface);
                 child.painter().text(
-                    r.center(),
+                    corner,
                     egui::Align2::CENTER_CENTER,
-                    glyph,
-                    egui::FontId::proportional(20.0),
+                    badge,
+                    egui::FontId::proportional(10.0),
                     palette.text,
                 );
-                response
             }
-            (_, Some(texture)) => child.add(
-                egui::Image::new(texture)
-                    .fit_to_exact_size(vec2(THUMB, THUMB))
-                    .sense(Sense::click()),
-            ),
-            _ => {
-                child
-                    .allocate_exact_size(vec2(THUMB, THUMB), Sense::click())
-                    .1
+            if picture.clicked() {
+                if child.input(|input| input.modifiers.command) {
+                    // Ctrl+click on the picture loads the layer as a selection.
+                    clicked.push(Cmd::SelectionFromLayer(index));
+                } else {
+                    clicked.push(Cmd::SelectLayer(index));
+                    self.canvas.paint_mask = false;
+                }
             }
-        };
-        if picture.clicked() {
-            clicked.push(Cmd::SelectLayer(index));
-            self.canvas.paint_mask = false;
-        }
-        // Ctrl+click on the picture loads the layer as a selection.
-        if picture.clicked() && child.input(|input| input.modifiers.command) {
-            clicked.push(Cmd::SelectionFromLayer(index));
-        }
-        if !active || !painting_mask {
-            child.painter().rect_stroke(
-                picture.rect,
-                CornerRadius::ZERO,
-                Stroke::new(
-                    if active && !painting_mask { 1.5 } else { 0.0 },
-                    palette.accent,
-                ),
-                egui::StrokeKind::Outside,
-            );
+            if picture.double_clicked() && matches!(layer.content, Content::Smart(_)) {
+                clicked.push(Cmd::SelectLayer(index));
+                clicked.push(Cmd::EditContents);
+            }
+            if active && !painting_mask {
+                child.painter().rect_stroke(
+                    picture.rect,
+                    CornerRadius::ZERO,
+                    Stroke::new(1.5, palette.accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
         }
         if let Some(mask) = layer.mask.clone() {
             let mask_texture = self.mask_thumb(child.ctx(), &mask, tab_id, index, version);
+            let size = if self.tabs[self.active].doc.layers[index].content.is_group() {
+                20.0
+            } else {
+                THUMB
+            };
             let response = child.add(
                 egui::Image::new(&mask_texture)
-                    .fit_to_exact_size(vec2(THUMB, THUMB))
+                    .fit_to_exact_size(vec2(size, size))
                     .sense(Sense::click()),
             );
             if painting_mask {
@@ -281,47 +483,62 @@ impl GodApp {
                 );
             }
             if response.clicked() {
-                clicked.push(Cmd::SelectLayer(index));
-                self.canvas.paint_mask = true;
+                if child.input(|input| input.modifiers.shift) {
+                    clicked.push(Cmd::SelectLayer(index));
+                    clicked.push(Cmd::ToggleMask);
+                } else {
+                    clicked.push(Cmd::SelectLayer(index));
+                    self.canvas.paint_mask = true;
+                }
             }
             response.on_hover_text("Click to paint on the mask; Shift+click to turn it off");
         }
         let tab = &self.tabs[self.active];
         let layer = &tab.doc.layers[index];
-        let name = RichText::new(&layer.name).color(if layer.visible {
-            palette.text
-        } else {
+        let hidden = tab.doc.hidden(index);
+        let name = RichText::new(&layer.name).color(if hidden {
             palette.text_dim
+        } else {
+            palette.text
         });
         let label = child.add(egui::Label::new(name).truncate().sense(Sense::click()));
-        if label.clicked() {
-            clicked.push(Cmd::SelectLayer(index));
-        }
         if label.double_clicked() {
             clicked.push(Cmd::SelectLayer(index));
             clicked.push(Cmd::RenameLayer);
+        } else if label.clicked() {
+            clicked.push(self.pick_cmd(child.ctx(), index));
         }
         child.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if layer.locked {
                 ui.label(RichText::new(icon::LOCK).color(palette.text_dim));
+            }
+            if layer.link != 0 {
+                ui.label(RichText::new(icon::LINK_SIMPLE).color(palette.text_dim))
+                    .on_hover_text("Linked: moves with the other linked layers");
             }
             if layer.effects.any() {
                 ui.label(RichText::new("fx").italics().color(palette.text_dim));
             }
         });
         if response.clicked() {
-            clicked.push(Cmd::SelectLayer(index));
+            clicked.push(self.pick_cmd(ui.ctx(), index));
         }
         response.context_menu(|ui| {
             for (label, cmd) in [
                 ("Duplicate Layer", Cmd::DuplicateLayer),
                 ("Delete Layer", Cmd::DeleteLayer),
                 ("Rename Layer…", Cmd::RenameLayer),
+                ("Group Layers", Cmd::GroupLayers),
+                ("Ungroup Layers", Cmd::Ungroup),
                 ("Layer Style…", Cmd::LayerStyleDialog),
                 ("Copy Layer Style", Cmd::CopyStyle),
                 ("Paste Layer Style", Cmd::PasteStyle),
                 ("Clear Layer Style", Cmd::ClearStyle),
+                ("Convert to Smart Object", Cmd::ConvertToSmart),
+                ("Edit Contents", Cmd::EditContents),
                 ("Create Clipping Mask", Cmd::ClippingMask),
+                ("Link Layers", Cmd::LinkLayers),
+                ("Unlink Layers", Cmd::UnlinkLayers),
                 ("Rasterize Layer", Cmd::Rasterize),
                 ("Merge Down", Cmd::MergeDown),
                 ("Merge Visible", Cmd::MergeVisible),
@@ -329,11 +546,91 @@ impl GodApp {
                 ("Select Pixels", Cmd::SelectionFromLayer(index)),
             ] {
                 if ui.button(label).clicked() {
-                    clicked.insert(0, Cmd::SelectLayer(index));
+                    if !self.tabs[self.active].picked.contains(&index) {
+                        clicked.insert(0, Cmd::SelectLayer(index));
+                    }
                     clicked.push(cmd);
                 }
             }
         });
+    }
+
+    /// A click on a row: only this layer, or Ctrl to add it, or Shift for a range.
+    fn pick_cmd(&self, ctx: &egui::Context, index: usize) -> Cmd {
+        let modifiers = ctx.input(|input| input.modifiers);
+        if modifiers.command {
+            Cmd::PickLayer {
+                index,
+                range: false,
+            }
+        } else if modifiers.shift {
+            Cmd::PickLayer { index, range: true }
+        } else {
+            Cmd::SelectLayer(index)
+        }
+    }
+
+    /// The filters of a smart object, under its row.
+    fn smart_filter_rows(
+        &mut self,
+        ui: &mut Ui,
+        palette: &Palette,
+        index: usize,
+        depth: usize,
+        clicked: &mut Vec<Cmd>,
+    ) {
+        let tab = &self.tabs[self.active];
+        let Content::Smart(smart) = &tab.doc.layers[index].content else {
+            return;
+        };
+        if smart.filters.is_empty() {
+            return;
+        }
+        let indent = 30.0 + depth as f32 * 14.0;
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.label(
+                RichText::new(format!("{}  Smart Filters", icon::FUNNEL))
+                    .color(palette.text_dim)
+                    .size(12.0),
+            );
+        });
+        for (number, filter) in smart.filters.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_space(indent + 10.0);
+                let eye = if filter.on {
+                    icon::EYE
+                } else {
+                    icon::EYE_SLASH
+                };
+                if widgets::small_icon_button(ui, eye, "Turn the filter on or off").clicked() {
+                    clicked.push(Cmd::SmartFilter {
+                        layer: index,
+                        filter: number,
+                        action: SmartAction::Toggle,
+                    });
+                }
+                let name = ui.add(
+                    egui::Label::new(RichText::new(filter.filter.name()).size(12.5))
+                        .sense(Sense::click()),
+                );
+                if name.double_clicked() {
+                    clicked.push(Cmd::SmartFilter {
+                        layer: index,
+                        filter: number,
+                        action: SmartAction::Edit,
+                    });
+                }
+                name.on_hover_text("Double-click to change its settings");
+                if widgets::small_icon_button(ui, icon::TRASH, "Delete the filter").clicked() {
+                    clicked.push(Cmd::SmartFilter {
+                        layer: index,
+                        filter: number,
+                        action: SmartAction::Delete,
+                    });
+                }
+            });
+        }
     }
 
     fn layer_thumb(
@@ -545,6 +842,108 @@ impl GodApp {
                 let (x, y, w, h) = bounds;
                 ui.label(format!("W {w} px   H {h} px\nX {x} px   Y {y} px"));
             }
+            Content::Pattern { pattern, scale } => {
+                ui.label(RichText::new("Pattern Fill").strong());
+                egui::ComboBox::from_label("Pattern")
+                    .selected_text("Pick…")
+                    .show_ui(ui, |ui| {
+                        for (label, choice) in &self.patterns {
+                            if ui.button(label).clicked() {
+                                *pattern = choice.clone();
+                                changed = true;
+                            }
+                        }
+                    });
+                changed |= ui
+                    .add(egui::Slider::new(scale, 0.1..=10.0).text("Scale"))
+                    .changed();
+                name = Some("Edit Pattern Fill");
+            }
+            Content::Shape(vector) => {
+                ui.label(RichText::new("Shape").strong());
+                changed |= shape_editor(ui, vector);
+                name = Some("Edit Shape");
+            }
+            Content::Smart(smart) => {
+                ui.label(RichText::new("Smart Object").strong());
+                let (x, y, w, h) = smart.bounds();
+                ui.label(format!(
+                    "Inside: {} × {} px\nOn the canvas: {w:.0} × {h:.0} px at {x:.0}, {y:.0}",
+                    smart.document.width, smart.document.height
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Edit Contents").clicked() {
+                        clicked.push(Cmd::EditContents);
+                    }
+                    if ui.button("Replace…").clicked() {
+                        clicked.push(Cmd::ReplaceContents);
+                    }
+                    if ui.button("Rasterize").clicked() {
+                        clicked.push(Cmd::Rasterize);
+                    }
+                });
+                ui.label(format!(
+                    "{} smart filters (Filter menu adds more)",
+                    smart.filters.len()
+                ));
+            }
+            Content::Group(group) => {
+                let title = if group.artboard.is_some() {
+                    "Artboard"
+                } else {
+                    "Group"
+                };
+                ui.label(RichText::new(title).strong());
+                changed |= ui
+                    .checkbox(&mut group.pass_through, "Pass Through")
+                    .changed();
+                if let Some(board) = &mut group.artboard {
+                    egui::Grid::new("artboard").num_columns(2).show(ui, |ui| {
+                        ui.label("Position");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut board.x).prefix("X "))
+                                .changed();
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut board.y).prefix("Y "))
+                                .changed();
+                        });
+                        ui.end_row();
+                        ui.label("Size");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut board.width)
+                                        .range(1..=30000)
+                                        .prefix("W "),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut board.height)
+                                        .range(1..=30000)
+                                        .prefix("H "),
+                                )
+                                .changed();
+                        });
+                        ui.end_row();
+                        ui.label("Background");
+                        let mut on = board.background.is_some();
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut on, "").changed() {
+                                board.background = on.then_some([255, 255, 255, 255]);
+                                changed = true;
+                            }
+                            if let Some(color) = &mut board.background {
+                                changed |= color_edit(ui, color);
+                            }
+                        });
+                        ui.end_row();
+                    });
+                }
+                name = Some("Edit Group");
+            }
+            Content::GroupEnd => {}
         }
         if let Some(mask) = &layer.mask {
             ui.add_space(6.0);
@@ -1346,6 +1745,95 @@ pub fn gradient_editor(ui: &mut Ui, gradient: &mut godphoto_core::paint::Gradien
     });
     if changed {
         gradient.stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    changed
+}
+
+/// Fill, stroke and the ways the parts of a shape combine.
+fn shape_editor(ui: &mut Ui, vector: &mut godphoto_core::vector::Vector) -> bool {
+    use godphoto_core::vector::{PathOp, StrokeAlign, VectorStroke};
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let mut filled = vector.fill.is_some() || vector.gradient.is_some();
+        if ui.checkbox(&mut filled, "Fill").changed() {
+            vector.fill = filled.then_some([0, 0, 0, 255]);
+            vector.gradient = None;
+            changed = true;
+        }
+        if let Some(color) = &mut vector.fill {
+            changed |= color_edit(ui, color);
+        }
+        let mut gradient = vector.gradient.is_some();
+        if ui.checkbox(&mut gradient, "Gradient").changed() {
+            vector.gradient = gradient.then(|| {
+                let (x, y, w, h) = vector.bounds().unwrap_or((0.0, 0.0, 100.0, 100.0));
+                let mut g =
+                    godphoto_core::paint::Gradient::two([0, 0, 0, 255], [255, 255, 255, 255]);
+                g.start = (x, y + h / 2.0);
+                g.end = (x + w, y + h / 2.0);
+                g
+            });
+            changed = true;
+        }
+    });
+    if let Some(gradient) = &mut vector.gradient {
+        changed |= gradient_editor(ui, gradient);
+    }
+    ui.horizontal(|ui| {
+        let mut stroked = vector.stroke.is_some();
+        if ui.checkbox(&mut stroked, "Stroke").changed() {
+            vector.stroke = stroked.then(VectorStroke::default);
+            changed = true;
+        }
+        if let Some(stroke) = &mut vector.stroke {
+            changed |= color_edit(ui, &mut stroke.color);
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut stroke.width)
+                        .range(0.1..=500.0)
+                        .suffix(" px"),
+                )
+                .changed();
+        }
+    });
+    if let Some(stroke) = &mut vector.stroke {
+        ui.horizontal(|ui| {
+            for (align, label) in [
+                (StrokeAlign::Inside, "Inside"),
+                (StrokeAlign::Center, "Center"),
+                (StrokeAlign::Outside, "Outside"),
+            ] {
+                changed |= ui
+                    .selectable_value(&mut stroke.align, align, label)
+                    .changed();
+            }
+            for (label, dash) in [
+                ("Solid", vec![]),
+                ("Dashed", vec![3.0, 2.0]),
+                ("Dotted", vec![0.5, 1.5]),
+            ] {
+                if ui.selectable_label(stroke.dash == dash, label).clicked() {
+                    stroke.dash = dash;
+                    changed = true;
+                }
+            }
+        });
+    }
+    if vector.paths.len() > 1 {
+        ui.label(RichText::new("Parts of the path").weak());
+        for (index, path) in vector.paths.iter_mut().enumerate().skip(1) {
+            ui.horizontal(|ui| {
+                ui.label(format!("Part {}", index + 1));
+                for (op, label) in [
+                    (PathOp::Unite, "Unite"),
+                    (PathOp::Subtract, "Subtract"),
+                    (PathOp::Intersect, "Intersect"),
+                    (PathOp::Exclude, "Exclude"),
+                ] {
+                    changed |= ui.selectable_value(&mut path.op, op, label).changed();
+                }
+            });
+        }
     }
     changed
 }

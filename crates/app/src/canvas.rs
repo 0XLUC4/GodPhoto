@@ -9,23 +9,19 @@ use godphoto_core::transform::{self, Affine, Resample};
 use godphoto_core::{Content, GrayImage, Layer, RgbaImage, select};
 
 use crate::app::{Cmd, GodApp, gray_to_rgba, rgba_to_gray, to_color};
+use crate::paths::{Part, PathTarget};
 use crate::theme::Palette;
 use crate::tools::{Request, Tool};
+use godphoto_core::vector::{Vector, VectorStroke};
 
 const RULER: f32 = 18.0;
 const HANDLE: f32 = 8.0;
 
-/// A point of a pen path, in image pixels.
-#[derive(Clone, Copy, Debug)]
-pub struct Anchor {
-    pub at: Pos2,
-    pub before: Pos2,
-    pub after: Pos2,
-}
-
 /// A layer being moved, scaled, turned or distorted, shown apart until applied.
 pub struct Transforming {
     pub layer: usize,
+    /// Every layer the transform carries.
+    pub layers: Vec<usize>,
     /// The area of the layer that moves, in image pixels.
     pub source: Rect,
     /// Where the corners of `source` go: top left, top right, bottom right, bottom left.
@@ -106,11 +102,30 @@ pub enum Drag {
     Patch {
         start: Pos2,
     },
-    PenHandle {
-        index: usize,
+    PathPoint {
+        target: PathTarget,
+        path: usize,
+        anchor: usize,
+        part: Part,
+        mirror: bool,
     },
-    PenMove {
+    PathMove {
+        target: PathTarget,
+        last: Pos2,
+    },
+    ArtboardNew {
+        start: Pos2,
+    },
+    ArtboardMove {
+        header: usize,
+        start: Pos2,
+    },
+    SliceNew {
+        start: Pos2,
+    },
+    SliceMove {
         index: usize,
+        last: Pos2,
     },
     Freeform {
         points: Vec<Pos2>,
@@ -150,8 +165,10 @@ pub struct CanvasState {
     pub poly: Vec<Pos2>,
     /// The crop box corners, top left first, clockwise.
     pub crop: Option<[Pos2; 4]>,
-    pub path: Vec<Anchor>,
-    pub path_closed: bool,
+    /// The pen's work path.
+    pub work: Vec<godphoto_core::vector::SubPath>,
+    /// The slice picked with Slice Select.
+    pub slice: Option<usize>,
     pub ruler: Option<(Pos2, Pos2)>,
     pub transform: Option<Transforming>,
     pub moving: Option<Moving>,
@@ -167,6 +184,8 @@ pub struct CanvasState {
     overlay_version: u64,
     /// Pointer position at the last frame of a drag, in image pixels.
     last: Option<Pos2>,
+    /// How hard the pen presses, 0..=1 (1 with a mouse).
+    pub pressure: f32,
 }
 
 impl CanvasState {
@@ -288,6 +307,20 @@ impl GodApp {
             }
         }
         let map = mapping(&self.tabs[self.active], area);
+        // A pen reports how hard it presses; a mouse presses fully.
+        let force = ui.input(|input| {
+            input.events.iter().rev().find_map(|event| match event {
+                egui::Event::Touch {
+                    force: Some(force), ..
+                } => Some(*force),
+                _ => None,
+            })
+        });
+        if let Some(force) = force {
+            self.canvas.pressure = force.clamp(0.0, 1.0);
+        } else if !ui.input(|input| input.pointer.any_down()) {
+            self.canvas.pressure = 1.0;
+        }
         let pointer = ui.input(|input| input.pointer.hover_pos());
         self.canvas.hover = pointer
             .filter(|p| area.contains(*p))
@@ -295,6 +328,24 @@ impl GodApp {
             .map(|p| (p.x, p.y));
 
         // ---- draw the image
+        let view = (self.proof_on || self.gamut_on).then(|| {
+            let target = godphoto_core::color::built_in()
+                .into_iter()
+                .nth(self.proof_target)
+                .map(|(_, p)| p)
+                .unwrap_or_else(godphoto_core::color::Profile::srgb);
+            crate::doc::ColorView {
+                key: (
+                    self.proof_target,
+                    self.intent as u8,
+                    self.proof_on,
+                    self.gamut_on,
+                ),
+                proof: self.proof_on.then(|| (target.clone(), self.intent)),
+                gamut: self.gamut_on.then_some(target),
+            }
+        });
+        self.tabs[self.active].set_view(view);
         let texture = self.tabs[self.active].texture(&ctx);
         let painter = ui.painter_at(full);
         let corners = [
@@ -490,22 +541,32 @@ impl GodApp {
             } else if self.canvas.poly.len() > 2 {
                 let points = std::mem::take(&mut self.canvas.poly);
                 self.lasso_selection(&points, self.options.mode, tool == Tool::MagneticLasso);
-            } else if !self.canvas.path.is_empty() {
-                self.canvas.path_closed = true;
+            } else if let Some(last) = self.canvas.work.last_mut() {
+                last.closed = true;
             }
         }
         if escape {
             if self.canvas.transform.take().is_some() || self.canvas.moving.take().is_some() {
                 let tab = &mut self.tabs[self.active];
-                tab.hidden = None;
+                tab.hidden.clear();
                 tab.recomposite();
             }
             self.canvas.crop = None;
             self.canvas.poly.clear();
             self.canvas.drag = None;
         }
-        if delete && !self.canvas.path.is_empty() && matches!(tool, Tool::Pen | Tool::FreeformPen) {
-            self.canvas.path.pop();
+        let pen = matches!(tool, Tool::Pen | Tool::FreeformPen | Tool::CurvaturePen);
+        if delete && !self.canvas.work.is_empty() && pen {
+            self.delete_last_anchor();
+        } else if delete
+            && tool == Tool::SliceSelect
+            && let Some(index) = self.canvas.slice.take()
+        {
+            let tab = &mut self.tabs[self.active];
+            if index < tab.doc.slices.len() {
+                tab.doc.slices.remove(index);
+                tab.commit("Delete Slice");
+            }
         } else if delete {
             clicked.push(Cmd::Clear);
         }
@@ -760,7 +821,38 @@ impl GodApp {
                 None
             }
             Tool::Gradient => Some(Drag::Gradient { start: at }),
-            Tool::Pen => self.press_pen(at, map, modifiers),
+            Tool::Pen
+            | Tool::CurvaturePen
+            | Tool::PathSelection
+            | Tool::DirectSelection
+            | Tool::AddAnchor
+            | Tool::DeleteAnchor
+            | Tool::ConvertPoint => self.press_path(at, map, tool, modifiers),
+            Tool::Artboard => {
+                let tab = &self.tabs[self.active];
+                let (x, y) = (at.x.max(0.0) as u32, at.y.max(0.0) as u32);
+                let hit = (0..tab.doc.layers.len()).rev().find(|i| {
+                    matches!(&tab.doc.layers[*i].content,
+                        Content::Group(godphoto_core::Group { artboard: Some(board), .. })
+                            if board.contains(x, y))
+                });
+                match hit {
+                    Some(header) => Some(Drag::ArtboardMove { header, start: at }),
+                    None => Some(Drag::ArtboardNew { start: at }),
+                }
+            }
+            Tool::Slice => Some(Drag::SliceNew { start: at }),
+            Tool::SliceSelect => {
+                let tab = &self.tabs[self.active];
+                self.canvas.slice = tab.doc.slices.iter().rposition(|slice| {
+                    let min = pos2(slice.x as f32, slice.y as f32);
+                    Rect::from_min_size(min, vec2(slice.width as f32, slice.height as f32))
+                        .contains(at)
+                });
+                self.canvas
+                    .slice
+                    .map(|index| Drag::SliceMove { index, last: at })
+            }
             Tool::FreeformPen => Some(Drag::Freeform { points: vec![at] }),
             Tool::Type | Tool::VerticalType | Tool::TypeMask | Tool::VerticalTypeMask => {
                 self.start_text(at, tool);
@@ -799,7 +891,28 @@ impl GodApp {
     }
 
     fn drag_to(&mut self, at: Pos2, map: Mapping, modifiers: Modifiers) {
+        if matches!(
+            self.canvas.drag,
+            Some(Drag::PathPoint { .. } | Drag::PathMove { .. })
+        ) {
+            self.drag_path(at);
+            return;
+        }
+        if let Some(Drag::SliceMove { index, last }) = self.canvas.drag {
+            let d = (at - last).round();
+            let tab = &mut self.tabs[self.active];
+            if let Some(slice) = tab.doc.slices.get_mut(index) {
+                slice.x = (slice.x as f32 + d.x).max(0.0) as u32;
+                slice.y = (slice.y as f32 + d.y).max(0.0) as u32;
+            }
+            self.canvas.drag = Some(Drag::SliceMove {
+                index,
+                last: last + d,
+            });
+            return;
+        }
         let last = self.canvas.last.unwrap_or(at);
+        let (pressure, pressed) = self.pressed_brush();
         let Some(drag) = self.canvas.drag.as_mut() else {
             return;
         };
@@ -832,14 +945,14 @@ impl GodApp {
                 } else {
                     tab.selection.take()
                 };
-                let brush = &self.options.brush;
+                let brush = &pressed;
                 let area = match target {
                     Target::Layer => tab.pixels_mut().and_then(|image| {
-                        stroke.to(image, at.x, at.y, 1.0, brush, tool, selection.as_ref())
+                        stroke.to(image, at.x, at.y, pressure, brush, tool, selection.as_ref())
                     }),
                     Target::Mask | Target::QuickMask => {
                         self.canvas.buffer.as_mut().and_then(|image| {
-                            stroke.to(image, at.x, at.y, 1.0, brush, tool, selection.as_ref())
+                            stroke.to(image, at.x, at.y, pressure, brush, tool, selection.as_ref())
                         })
                     }
                 };
@@ -952,20 +1065,6 @@ impl GodApp {
                             moving.offset.x = 0.0;
                         }
                     }
-                }
-            }
-            Drag::PenHandle { index } => {
-                if let Some(anchor) = self.canvas.path.get_mut(*index) {
-                    anchor.after = at;
-                    anchor.before = anchor.at - (at - anchor.at);
-                }
-            }
-            Drag::PenMove { index } => {
-                if let Some(anchor) = self.canvas.path.get_mut(*index) {
-                    let d = at - anchor.at;
-                    anchor.at += d;
-                    anchor.before += d;
-                    anchor.after += d;
                 }
             }
             Drag::Guide { index } => {
@@ -1134,17 +1233,40 @@ impl GodApp {
             }
             Drag::Freeform { mut points } => {
                 points.push(at);
-                self.canvas.path = points
-                    .iter()
-                    .step_by(2)
-                    .map(|p| Anchor {
-                        at: *p,
-                        before: *p,
-                        after: *p,
-                    })
-                    .collect();
-                self.canvas.path_closed = false;
+                self.finish_freeform(points);
             }
+            Drag::PathPoint { target, .. } | Drag::PathMove { target, .. } => {
+                self.path_edited(target)
+            }
+            Drag::ArtboardNew { start } => {
+                let r = rect_of(self.snapped_free(start), self.snapped_free(at));
+                if r.width() >= 4.0 && r.height() >= 4.0 {
+                    self.new_artboard(r);
+                }
+            }
+            Drag::ArtboardMove { header, start } => {
+                let d = (at - start).round();
+                self.move_artboard(header, d.x as i32, d.y as i32);
+            }
+            Drag::SliceNew { start } => {
+                let r = rect_of(self.snapped_free(start), self.snapped_free(at));
+                let canvas = Rect::from_min_size(Pos2::ZERO, vec2(width as f32, height as f32));
+                let r = r.intersect(canvas);
+                if r.width() >= 2.0 && r.height() >= 2.0 {
+                    let tab = &mut self.tabs[self.active];
+                    let name = format!("slice_{:02}", tab.doc.slices.len() + 1);
+                    tab.doc.slices.push(godphoto_core::Slice {
+                        name,
+                        x: r.min.x.round() as u32,
+                        y: r.min.y.round() as u32,
+                        width: r.width().round() as u32,
+                        height: r.height().round() as u32,
+                    });
+                    self.canvas.slice = Some(tab.doc.slices.len() - 1);
+                    tab.commit("Slice");
+                }
+            }
+            Drag::SliceMove { .. } => self.tabs[self.active].commit("Move Slice"),
             Drag::Guide { index } => {
                 let tab = &mut self.tabs[self.active];
                 let outside =
@@ -1166,10 +1288,7 @@ impl GodApp {
                 self.on_pixels("Red Eye", |image, _| paint::red_eye(image, &region));
             }
             Drag::Transform { .. } | Drag::CropCorner { .. } | Drag::CropMove { .. } => {}
-            Drag::PenHandle { .. }
-            | Drag::PenMove { .. }
-            | Drag::Pan { .. }
-            | Drag::Turn { .. } => {}
+            Drag::Pan { .. } | Drag::Turn { .. } => {}
         }
     }
 
@@ -1273,6 +1392,21 @@ impl GodApp {
     }
 
     // ------------------------------------------------------------ painting
+
+    /// The pen's pressure for the stroke, and the brush with its opacity set by it.
+    fn pressed_brush(&self) -> (f32, godphoto_core::paint::Brush) {
+        let pressure = self.canvas.pressure.max(0.05);
+        let mut brush = self.options.brush.clone();
+        if self.options.pressure_opacity {
+            brush.opacity *= pressure;
+        }
+        let size = if self.options.pressure_size {
+            pressure
+        } else {
+            1.0
+        };
+        (size, brush)
+    }
 
     fn start_paint(&mut self, at: Pos2, tool: Tool) -> Option<Drag> {
         let fg = self.fg;
@@ -1428,14 +1562,16 @@ impl GodApp {
         } else {
             tab.selection.take()
         };
-        let brush = &self.options.brush;
+        let (pressure, brush) = self.pressed_brush();
+        let brush = &brush;
+        let tab = &mut self.tabs[self.active];
         let area = match target {
             Target::Layer => tab.pixels_mut().and_then(|image| {
                 stroke.to(
                     image,
                     at.x,
                     at.y,
-                    1.0,
+                    pressure,
                     brush,
                     &paint_tool,
                     selection.as_ref(),
@@ -1446,7 +1582,7 @@ impl GodApp {
                     image,
                     at.x,
                     at.y,
-                    1.0,
+                    pressure,
                     brush,
                     &paint_tool,
                     selection.as_ref(),
@@ -1525,22 +1661,17 @@ impl GodApp {
         };
         let line = self.tool == Tool::Line;
         let fill = (options.shape_fill || line).then_some(self.fg);
-        let stroke_color = if options.shape_fill { self.bg } else { self.fg };
-        let stroke =
-            (options.shape_stroke && !line).then_some((stroke_color, options.stroke_width));
-        let (width, height) = self.tabs[self.active].size();
-        let mut image = RgbaImage::new(width, height);
-        paint::draw_shape(
-            &mut image,
-            &shape,
-            (start.x, start.y),
-            (end.x, end.y),
-            fill,
-            stroke,
-        );
+        let stroke = (options.shape_stroke && !line).then(|| VectorStroke {
+            color: if options.shape_fill { self.bg } else { self.fg },
+            width: options.stroke_width,
+            dash: options.dash.clone(),
+            align: options.stroke_align,
+        });
+        let vector = Vector::from_shape(&shape, (start.x, start.y), (end.x, end.y), fill, stroke);
         let name = self.tool.name().to_owned();
         let layer_name = self.next_name(&name);
-        self.add_layer(Layer::pixels(layer_name, image), &format!("New {name}"));
+        let layer = Layer::new(layer_name, Content::Shape(vector));
+        self.add_layer(layer, &format!("New {name}"));
     }
 
     fn next_name(&self, base: &str) -> String {
@@ -1551,51 +1682,6 @@ impl GodApp {
             .expect("some number is free")
     }
 
-    fn press_pen(&mut self, at: Pos2, map: Mapping, modifiers: Modifiers) -> Option<Drag> {
-        let near = self
-            .canvas
-            .path
-            .iter()
-            .position(|anchor| (anchor.at - at).length() * map.zoom < 7.0);
-        if modifiers.command
-            && let Some(index) = near
-        {
-            return Some(Drag::PenMove { index });
-        }
-        if near == Some(0) && self.canvas.path.len() > 2 {
-            self.canvas.path_closed = true;
-            return None;
-        }
-        if self.canvas.path_closed {
-            self.canvas.path.clear();
-            self.canvas.path_closed = false;
-        }
-        self.canvas.path.push(Anchor {
-            at,
-            before: at,
-            after: at,
-        });
-        Some(Drag::PenHandle {
-            index: self.canvas.path.len() - 1,
-        })
-    }
-
-    fn path_points(&self) -> Vec<(f32, f32)> {
-        let anchors: Vec<_> = self
-            .canvas
-            .path
-            .iter()
-            .map(|a| {
-                (
-                    (a.at.x, a.at.y),
-                    (a.before.x, a.before.y),
-                    (a.after.x, a.after.y),
-                )
-            })
-            .collect();
-        paint::bezier(&anchors, self.canvas.path_closed)
-    }
-
     pub fn request(&mut self, ctx: &egui::Context, request: Request) {
         if !self.has_tab() {
             return;
@@ -1603,36 +1689,41 @@ impl GodApp {
         let (width, height) = self.tabs[self.active].size();
         match request {
             Request::PathToSelection => {
-                let points = self.path_points();
-                if points.len() > 2 {
-                    self.combine_selection(
-                        select::polygon(width, height, &points),
-                        "Make Selection",
-                    );
+                if !self.canvas.work.is_empty() {
+                    let vector = self.work_vector(Some([0, 0, 0, 255]), None);
+                    self.combine_selection(vector.coverage(width, height), "Make Selection");
                 }
             }
             Request::FillPath | Request::StrokePath => {
-                let points = self.path_points();
-                let closed = self.canvas.path_closed;
-                let (fill, stroke) = if matches!(request, Request::FillPath) {
-                    (Some(self.fg), None)
+                let vector = if matches!(request, Request::FillPath) {
+                    self.work_vector(Some(self.fg), None)
                 } else {
-                    (None, Some((self.fg, self.options.stroke_width)))
+                    let stroke = VectorStroke {
+                        color: self.fg,
+                        width: self.options.stroke_width,
+                        ..VectorStroke::default()
+                    };
+                    self.work_vector(None, Some(stroke))
                 };
+                let top = vector.render(width, height);
                 self.on_pixels("Path", |image, _| {
-                    paint::draw_path(image, &points, closed, fill, stroke)
+                    godphoto_core::blend::composite(image, &top, godphoto_core::Blend::Normal, 1.0);
                 });
             }
             Request::ShapeFromPath => {
-                let points = self.path_points();
-                let mut image = RgbaImage::new(width, height);
-                paint::draw_path(&mut image, &points, true, Some(self.fg), None);
-                let name = self.next_name("Shape");
-                self.add_layer(Layer::pixels(name, image), "New Shape");
+                if !self.canvas.work.is_empty() {
+                    let vector = self.work_vector(Some(self.fg), None);
+                    let name = self.next_name("Shape");
+                    self.add_layer(Layer::new(name, Content::Shape(vector)), "New Shape");
+                }
             }
-            Request::ClearPath => {
-                self.canvas.path.clear();
-                self.canvas.path_closed = false;
+            Request::ClearPath => self.canvas.work.clear(),
+            Request::SavePath => {
+                if !self.canvas.work.is_empty() {
+                    let tab = &mut self.tabs[self.active];
+                    let name = format!("Path {}", tab.paths.len() + 1);
+                    tab.paths.push((name, self.canvas.work.clone()));
+                }
             }
             Request::Straighten => {
                 if let Some((a, b)) = self.canvas.ruler {
@@ -1748,7 +1839,7 @@ impl GodApp {
             TextureOptions::LINEAR,
         );
         if !selected {
-            tab.hidden = Some(tab.active);
+            tab.hidden = vec![tab.active];
             tab.recomposite();
         }
         self.canvas.moving = Some(Moving {
@@ -1767,19 +1858,17 @@ impl GodApp {
         if self.canvas.transform.is_some() {
             return;
         }
+        let targets = self.targets();
         let tab = &mut self.tabs[self.active];
         let (width, height) = tab.size();
-        let Some(layer) = tab.layer() else {
-            return;
-        };
-        if layer.locked || layer.is_adjustment() {
-            self.toasts
-                .error("Pick an unlocked layer with pixels to transform.");
+        if targets.is_empty() {
+            self.toasts.error("Pick an unlocked layer to transform.");
             return;
         }
-        let Some(image) = layer.render(width, height) else {
-            return;
-        };
+        // The layers that move, drawn alone.
+        let mut alone = tab.doc.clone_empty();
+        alone.layers = targets.iter().map(|i| tab.doc.layers[*i].clone()).collect();
+        let image = alone.composite();
         let (x, y, w, h) = transform::trim(&image, true).unwrap_or((0, 0, width, height));
         let piece = transform::crop(&image, x, y, w, h);
         let texture = ctx.load_texture(
@@ -1788,10 +1877,11 @@ impl GodApp {
             TextureOptions::LINEAR,
         );
         let source = Rect::from_min_size(pos2(x as f32, y as f32), vec2(w as f32, h as f32));
-        tab.hidden = Some(tab.active);
+        tab.hidden = targets.clone();
         tab.recomposite();
         self.canvas.transform = Some(Transforming {
             layer: tab.active,
+            layers: targets,
             source,
             corners: [
                 source.left_top(),
@@ -1824,7 +1914,7 @@ impl GodApp {
     pub fn canvas_commit_transform(&mut self) {
         if let Some(moving) = self.canvas.moving.take() {
             let tab = &mut self.tabs[self.active];
-            tab.hidden = None;
+            tab.hidden.clear();
             tab.active = moving.layer.min(tab.doc.layers.len().saturating_sub(1));
             let (dx, dy) = (moving.offset.x as i32, moving.offset.y as i32);
             if dx == 0 && dy == 0 {
@@ -1868,62 +1958,45 @@ impl GodApp {
             return;
         };
         let tab = &mut self.tabs[self.active];
-        tab.hidden = None;
+        tab.hidden.clear();
         let (width, height) = tab.size();
         let c = transform.corners;
         let s = transform.source;
-        let parallel = ((c[0] + (c[2] - c[0])) - (c[1] + (c[3] - c[0]))).length() < 0.5;
-        let same = c
-            == [
-                s.left_top(),
-                s.right_top(),
-                s.right_bottom(),
-                s.left_bottom(),
-            ];
-        let Some(layer) = tab.doc.layers.get_mut(transform.layer) else {
-            return;
-        };
-        if same {
+        if c == [
+            s.left_top(),
+            s.right_top(),
+            s.right_bottom(),
+            s.left_bottom(),
+        ] {
             tab.recomposite();
             return;
         }
-        if !matches!(layer.content, Content::Pixels(_)) {
-            layer.rasterize(width, height);
-        }
-        let affine = parallel.then(|| {
-            let (w, h) = (s.width().max(1.0), s.height().max(1.0));
-            let a = (c[1] - c[0]) / w;
-            let b = (c[3] - c[0]) / h;
-            let t = c[0] - a * s.min.x - b * s.min.y;
-            Affine {
-                a: a.x,
-                b: a.y,
-                c: b.x,
-                d: b.y,
-                tx: t.x,
-                ty: t.y,
+        self.last_transform = Some((s, c));
+        let tab = &mut self.tabs[self.active];
+        for index in &transform.layers {
+            if let Some(layer) = tab.doc.layers.get_mut(*index) {
+                transform_layer(layer, s, c, width, height);
             }
-        });
-        let corners = c.map(|p| (p.x, p.y));
-        let source = (s.min.x, s.min.y, s.width(), s.height());
-        if let Content::Pixels(image) = &mut layer.content {
-            *image = match &affine {
-                Some(m) => transform::affine(image, m, Resample::Bicubic),
-                None => transform::perspective(image, corners, source),
-            };
-        }
-        if let Some(mask) = &mut layer.mask {
-            *mask = match &affine {
-                Some(m) => transform::affine_gray(mask, m),
-                None => rgba_to_gray(&transform::perspective(
-                    &gray_to_rgba(mask),
-                    corners,
-                    source,
-                )),
-            };
         }
         tab.active = transform.layer;
         tab.commit("Free Transform");
+    }
+
+    /// Edit › Transform › Again: the last transform once more, on the layers picked now.
+    pub fn transform_again(&mut self) {
+        let Some((s, c)) = self.last_transform else {
+            self.toasts.error("No transform has been made yet.");
+            return;
+        };
+        let targets = self.targets();
+        let tab = &mut self.tabs[self.active];
+        let (width, height) = tab.size();
+        for index in targets {
+            if let Some(layer) = tab.doc.layers.get_mut(index) {
+                transform_layer(layer, s, c, width, height);
+            }
+        }
+        tab.commit("Transform Again");
     }
 
     /// Change the whole active layer (selection ignored), committing `step` after.
@@ -2370,29 +2443,8 @@ impl GodApp {
                 Stroke::new(1.5, accent),
             );
         }
-        if !self.canvas.path.is_empty() {
-            let points: Vec<Pos2> = self
-                .path_points()
-                .into_iter()
-                .map(|(x, y)| map.to_screen(pos2(x, y)))
-                .collect();
-            painter.add(Shape::line(points, Stroke::new(1.5, accent)));
-            for anchor in &self.canvas.path {
-                let at = map.to_screen(anchor.at);
-                painter.rect_filled(
-                    Rect::from_center_size(at, Vec2::splat(6.0)),
-                    CornerRadius::ZERO,
-                    accent,
-                );
-                if anchor.after != anchor.at {
-                    for handle in [anchor.before, anchor.after] {
-                        let h = map.to_screen(handle);
-                        painter.line_segment([at, h], Stroke::new(1.0, accent));
-                        painter.circle_filled(h, 3.0, accent);
-                    }
-                }
-            }
-        }
+        self.draw_paths(painter, map, tool);
+        self.draw_boards(painter, map);
         let tab = &self.tabs[self.active];
         for (index, at) in tab.counts.iter().enumerate() {
             let s = map.to_screen(*at);
@@ -2787,4 +2839,86 @@ fn ruler_step(zoom: f32) -> f32 {
 #[allow(dead_code)]
 fn to_color32(color: [u8; 4]) -> Color32 {
     to_color(color)
+}
+
+/// Where the rectangle `s` maps a point, when its corners go to `c` (exact for moves,
+/// scales, turns and skews; close for perspective).
+fn map_point(s: Rect, c: [Pos2; 4], p: (f32, f32)) -> (f32, f32) {
+    let u = (p.0 - s.min.x) / s.width().max(1e-3);
+    let v = (p.1 - s.min.y) / s.height().max(1e-3);
+    let top = c[0] + (c[1] - c[0]) * u;
+    let bottom = c[3] + (c[2] - c[3]) * u;
+    let q = top + (bottom - top) * v;
+    (q.x, q.y)
+}
+
+/// Apply the transform of rectangle `s` onto corners `c` to one layer, keeping what it
+/// holds live where it can: shapes, smart objects, type and gradients stay editable.
+fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], width: u32, height: u32) {
+    let parallel = ((c[0] + (c[2] - c[0])) - (c[1] + (c[3] - c[0]))).length() < 0.5;
+    let affine = parallel.then(|| {
+        let (w, h) = (s.width().max(1.0), s.height().max(1.0));
+        let a = (c[1] - c[0]) / w;
+        let b = (c[3] - c[0]) / h;
+        let t = c[0] - a * s.min.x - b * s.min.y;
+        Affine {
+            a: a.x,
+            b: a.y,
+            c: b.x,
+            d: b.y,
+            tx: t.x,
+            ty: t.y,
+        }
+    });
+    let corners = c.map(|p| (p.x, p.y));
+    let source = (s.min.x, s.min.y, s.width(), s.height());
+    let map = |p: (f32, f32)| map_point(s, c, p);
+    match &mut layer.content {
+        Content::Shape(vector) => vector.transform(map),
+        Content::Smart(smart) => {
+            smart.corners = smart.corners.map(map);
+            smart.touch();
+        }
+        Content::Gradient(gradient) => {
+            gradient.start = map(gradient.start);
+            gradient.end = map(gradient.end);
+        }
+        Content::Text(text) if affine.is_some() => {
+            let m = affine.as_ref().expect("checked");
+            let scale = (m.a * m.d - m.b * m.c).abs().sqrt();
+            let (x, y) = map((text.x, text.y));
+            text.x = x;
+            text.y = y;
+            text.size *= scale;
+            text.tracking *= scale;
+            if let Some(w) = &mut text.width {
+                *w *= scale;
+            }
+            text.rotation += m.b.atan2(m.a).to_degrees();
+        }
+        Content::Fill(_) | Content::Pattern { .. } | Content::Adjustment(_) => {}
+        Content::Group(_) | Content::GroupEnd => {}
+        _ => {
+            // Pixels (and type bent by perspective) are drawn again.
+            if !matches!(layer.content, Content::Pixels(_)) {
+                layer.rasterize(width, height);
+            }
+            if let Content::Pixels(image) = &mut layer.content {
+                *image = match &affine {
+                    Some(m) => transform::affine(image, m, Resample::Bicubic),
+                    None => transform::perspective(image, corners, source),
+                };
+            }
+        }
+    }
+    if let Some(mask) = &mut layer.mask {
+        *mask = match &affine {
+            Some(m) => transform::affine_gray(mask, m),
+            None => rgba_to_gray(&transform::perspective(
+                &gray_to_rgba(mask),
+                corners,
+                source,
+            )),
+        };
+    }
 }
