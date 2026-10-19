@@ -12,8 +12,8 @@ use godphoto_core::paint::{self, Gradient};
 use godphoto_core::style::Pattern;
 use godphoto_core::transform::{self, Anchor, Resample};
 use godphoto_core::{
-    Adjustment, Background, Content, Document, Effects, Filter, GrayImage, Layer, RgbaImage,
-    adjust, select,
+    Adjustment, Background, Content, Depth, Document, Effects, Filter, GrayImage, Layer, Raster,
+    RgbaImage, adjust, map_raster, select, with_raster,
 };
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +163,8 @@ pub enum Cmd {
     TransformAgain,
     Warp,
     ModeDialog(godphoto_core::ColorMode),
+    /// Image › Mode › 8, 16 or 32 Bits/Channel.
+    SetDepth(Depth),
     SetMode {
         mode: godphoto_core::ColorMode,
         colors: usize,
@@ -760,14 +762,16 @@ impl GodApp {
             Cmd::Clear => self.clear_pixels("Clear"),
             Cmd::FillDialog => self.dialog = Some(Dialog::fill(self.fg)),
             Cmd::FillColor { color, opacity } => {
-                self.on_pixels("Fill", |image, selection| {
-                    paint::fill_selection(
-                        image,
-                        color,
-                        selection,
-                        opacity,
-                        godphoto_core::Blend::Normal,
-                    );
+                self.on_pixels("Fill", |raster, selection| {
+                    with_raster!(raster, image => {
+                        paint::fill_selection(
+                            image,
+                            color,
+                            selection,
+                            opacity,
+                            godphoto_core::Blend::Normal,
+                        );
+                    })
                 });
             }
             Cmd::FillContentAware => {
@@ -775,16 +779,20 @@ impl GodApp {
                     self.toasts.error("Select the area to fill first.");
                     return;
                 };
-                self.on_pixels("Content-Aware Fill", |image, _| {
-                    paint::content_aware_fill(image, &selection);
+                self.on_pixels("Content-Aware Fill", |raster, _| {
+                    with_raster!(raster, image => {
+                        paint::content_aware_fill(image, &selection);
+                    })
                 });
             }
             Cmd::FillPattern(index) => {
                 let Some((_, pattern)) = self.patterns.get(index).cloned() else {
                     return;
                 };
-                self.on_pixels("Fill", |image, selection| {
-                    paint::fill_pattern(image, &pattern, selection);
+                self.on_pixels("Fill", |raster, selection| {
+                    with_raster!(raster, image => {
+                        paint::fill_pattern(image, &pattern, selection);
+                    })
                 });
             }
             Cmd::StrokeDialog => self.dialog = Some(Dialog::stroke(self.fg)),
@@ -793,8 +801,10 @@ impl GodApp {
                     self.toasts.error("Make a selection to stroke first.");
                     return;
                 };
-                self.on_pixels("Stroke", |image, _| {
-                    paint::stroke_selection(image, &selection, width, color);
+                self.on_pixels("Stroke", |raster, _| {
+                    with_raster!(raster, image => {
+                        paint::stroke_selection(image, &selection, width, color);
+                    })
                 });
             }
             Cmd::FreeTransform => self.start_transform(ctx),
@@ -843,6 +853,13 @@ impl GodApp {
                 godphoto_core::color::set_mode(&mut tab.doc, mode, &options);
                 tab.active = tab.active.min(tab.doc.layers.len().saturating_sub(1));
                 tab.commit(mode.name());
+            }
+            Cmd::SetDepth(depth) => {
+                let tab = self.tab();
+                if tab.doc.depth != depth {
+                    tab.doc.set_depth(depth);
+                    tab.commit(depth.name());
+                }
             }
             Cmd::ProfileDialog { convert } => {
                 self.dialog = Some(Dialog::Profile {
@@ -941,12 +958,13 @@ impl GodApp {
             Cmd::Grayscale => {
                 let (width, height) = self.tab().size();
                 let tab = self.tab();
+                let depth = tab.doc.depth;
                 for layer in &mut tab.doc.layers {
                     if !layer.is_adjustment() {
-                        layer.rasterize(width, height);
+                        layer.rasterize(width, height, depth);
                     }
-                    if let Content::Pixels(image) = &mut layer.content {
-                        adjust::desaturate(image);
+                    if let Content::Pixels(raster) = &mut layer.content {
+                        with_raster!(raster, image => adjust::desaturate(image));
                     }
                 }
                 tab.commit("Grayscale");
@@ -958,15 +976,31 @@ impl GodApp {
             }
             Cmd::Adjust(adjustment) => {
                 let name = adjustment.name().to_owned();
-                self.on_pixels(&name, |image, _| adjustment.apply(image));
+                self.on_pixels(
+                    &name,
+                    |raster, _| with_raster!(raster, image => adjustment.apply(image)),
+                );
             }
-            Cmd::AutoTone => self.on_pixels("Auto Tone", |image, _| adjust::auto_tone(image)),
-            Cmd::AutoContrast => {
-                self.on_pixels("Auto Contrast", |image, _| adjust::auto_contrast(image))
-            }
-            Cmd::AutoColor => self.on_pixels("Auto Color", |image, _| adjust::auto_color(image)),
-            Cmd::Desaturate => self.on_pixels("Desaturate", |image, _| adjust::desaturate(image)),
-            Cmd::Equalize => self.on_pixels("Equalize", |image, _| adjust::equalize(image)),
+            Cmd::AutoTone => self.on_pixels(
+                "Auto Tone",
+                |raster, _| with_raster!(raster, image => adjust::auto_tone(image)),
+            ),
+            Cmd::AutoContrast => self.on_pixels(
+                "Auto Contrast",
+                |raster, _| with_raster!(raster, image => adjust::auto_contrast(image)),
+            ),
+            Cmd::AutoColor => self.on_pixels(
+                "Auto Color",
+                |raster, _| with_raster!(raster, image => adjust::auto_color(image)),
+            ),
+            Cmd::Desaturate => self.on_pixels(
+                "Desaturate",
+                |raster, _| with_raster!(raster, image => adjust::desaturate(image)),
+            ),
+            Cmd::Equalize => self.on_pixels(
+                "Equalize",
+                |raster, _| with_raster!(raster, image => adjust::equalize(image)),
+            ),
             Cmd::ShadowsHighlightsDialog => {
                 self.open_effect(crate::dialogs::Effect::ShadowsHighlights {
                     shadows: 35.0,
@@ -978,8 +1012,10 @@ impl GodApp {
                 shadows,
                 highlights,
                 radius,
-            } => self.on_pixels("Shadows/Highlights", |image, _| {
-                adjust::shadows_highlights(image, shadows, highlights, radius)
+            } => self.on_pixels("Shadows/Highlights", |raster, _| {
+                with_raster!(raster, image => {
+                    adjust::shadows_highlights(image, shadows, highlights, radius)
+                })
             }),
             Cmd::ReplaceColorDialog => self.open_effect(crate::dialogs::Effect::ReplaceColor {
                 from: [self.fg[0], self.fg[1], self.fg[2]],
@@ -994,8 +1030,10 @@ impl GodApp {
                 hue,
                 saturation,
                 lightness,
-            } => self.on_pixels("Replace Color", |image, _| {
-                adjust::replace_color(image, from, fuzziness, hue, saturation, lightness)
+            } => self.on_pixels("Replace Color", |raster, _| {
+                with_raster!(raster, image => {
+                    adjust::replace_color(image, from, fuzziness, hue, saturation, lightness)
+                })
             }),
             Cmd::MatchColorDialog => {
                 let source = self
@@ -1018,22 +1056,27 @@ impl GodApp {
                 else {
                     return;
                 };
-                self.on_pixels("Match Color", |image, _| {
-                    adjust::match_color(image, &reference, intensity)
+                self.on_pixels("Match Color", |raster, _| {
+                    with_raster!(raster, image => {
+                        adjust::match_color(image, &reference, intensity)
+                    })
                 });
             }
             Cmd::HdrToningDialog => self.open_effect(crate::dialogs::Effect::HdrToning {
                 strength: 50.0,
                 detail: 30.0,
             }),
-            Cmd::HdrToning { strength, detail } => self.on_pixels("HDR Toning", |image, _| {
-                adjust::hdr_toning(image, strength, detail)
+            Cmd::HdrToning { strength, detail } => self.on_pixels("HDR Toning", |raster, _| {
+                with_raster!(raster, image => {
+                    adjust::hdr_toning(image, strength, detail)
+                })
             }),
             Cmd::NewLayer => {
                 let (width, height) = self.tab().size();
+                let depth = self.tab().doc.depth;
                 let name = self.layer_name("Layer");
                 self.add_layer(
-                    Layer::pixels(name, RgbaImage::new(width, height)),
+                    Layer::pixels(name, Raster::new(width, height, depth)),
                     "New Layer",
                 );
             }
@@ -1156,10 +1199,10 @@ impl GodApp {
             Cmd::ApplyMask => {
                 self.canvas.paint_mask = false;
                 self.edit_layer("Apply Layer Mask", |layer| {
-                    if let (Some(mask), Content::Pixels(image)) =
+                    if let (Some(mask), Content::Pixels(raster)) =
                         (layer.mask.take(), &mut layer.content)
                     {
-                        godphoto_core::apply_mask(image, &mask);
+                        with_raster!(raster, image => godphoto_core::apply_mask(image, &mask));
                     }
                 });
             }
@@ -1207,9 +1250,10 @@ impl GodApp {
             }
             Cmd::Rasterize => {
                 let (width, height) = self.tab().size();
+                let depth = self.tab().doc.depth;
                 self.edit_layer("Rasterize Layer", |layer| {
                     if !layer.is_adjustment() {
-                        layer.rasterize(width, height);
+                        layer.rasterize(width, height, depth);
                     }
                 });
             }
@@ -1337,7 +1381,7 @@ impl GodApp {
                     .doc
                     .layers
                     .get(index)
-                    .and_then(|layer| layer.render(width, height))
+                    .and_then(|layer| layer.render_as::<u8>(width, height))
                 else {
                     return;
                 };
@@ -1520,13 +1564,10 @@ impl GodApp {
 
     /// Change the pixels of the active layer with `change`, only inside the selection.
     /// Type and fills are made into pixels first.
-    pub fn on_pixels(
-        &mut self,
-        step: &str,
-        change: impl FnOnce(&mut RgbaImage, Option<&GrayImage>),
-    ) {
+    pub fn on_pixels(&mut self, step: &str, change: impl FnOnce(&mut Raster, Option<&GrayImage>)) {
         let (width, height) = self.tab().size();
         let tab = &mut self.tabs[self.active];
+        let depth = tab.doc.depth;
         let selection = tab.selection.clone();
         let Some(layer) = tab.doc.layers.get_mut(tab.active) else {
             return;
@@ -1541,28 +1582,30 @@ impl GodApp {
             return;
         }
         if !matches!(layer.content, Content::Pixels(_)) {
-            layer.rasterize(width, height);
+            layer.rasterize(width, height, depth);
             self.toasts.success("The layer was rasterized.");
         }
-        let Content::Pixels(image) = &mut layer.content else {
+        let Content::Pixels(raster) = &mut layer.content else {
             return;
         };
         match &selection {
             Some(mask) => {
-                let mut changed = image.clone();
+                let mut changed = raster.clone();
                 change(&mut changed, Some(mask));
-                godphoto_core::mix(image, &changed, 1.0, Some(mask), None);
+                godphoto_core::mix_raster(raster, &changed, 1.0, Some(mask), None);
             }
-            None => change(image, None),
+            None => change(raster, None),
         }
         tab.commit(step);
     }
 
     fn clear_pixels(&mut self, step: &str) {
-        self.on_pixels(step, |image, _| {
-            for pixel in image.pixels_mut() {
-                pixel[3] = 0;
-            }
+        self.on_pixels(step, |raster, _| {
+            with_raster!(raster, image => {
+                for pixel in image.pixels_mut() {
+                    pixel[3] = Default::default();
+                }
+            })
         });
     }
 
@@ -1574,7 +1617,10 @@ impl GodApp {
         let mut image = if merged {
             tab.composite.clone()
         } else {
-            match tab.layer().and_then(|layer| layer.render(width, height)) {
+            match tab
+                .layer()
+                .and_then(|layer| layer.render_as::<u8>(width, height))
+            {
                 Some(image) => image,
                 None => {
                     self.toasts
@@ -1632,7 +1678,8 @@ impl GodApp {
         };
         let mut image = RgbaImage::new(width, height);
         image::imageops::replace(&mut image, &picture, x, y);
-        let mut layer = Layer::pixels(self.layer_name("Layer"), image);
+        let depth = self.tab().doc.depth;
+        let mut layer = Layer::pixels(self.layer_name("Layer"), Raster::from_rgba8(image, depth));
         if into {
             layer.mask = self.tab().selection.clone();
         }
@@ -1642,11 +1689,15 @@ impl GodApp {
     fn layer_via(&mut self, cut: bool) {
         let tab = &self.tabs[self.active];
         let (width, height) = tab.size();
-        let Some(mut image) = tab.layer().and_then(|layer| layer.render(width, height)) else {
+        let depth = tab.doc.depth;
+        let Some(mut image) = tab
+            .layer()
+            .and_then(|layer| layer.render(width, height, depth))
+        else {
             return;
         };
         if let Some(mask) = &tab.selection {
-            godphoto_core::apply_mask(&mut image, mask);
+            with_raster!(&mut image, image => godphoto_core::apply_mask(image, mask));
         }
         if cut {
             self.clear_pixels("Cut");
@@ -1689,14 +1740,15 @@ impl GodApp {
         step: &str,
         width: u32,
         height: u32,
-        image: impl Fn(&RgbaImage) -> RgbaImage,
+        image: impl Fn(&Raster) -> Raster,
         gray: impl Fn(&GrayImage) -> GrayImage,
     ) {
         let tab = self.tab();
         let (old_width, old_height) = tab.size();
+        let depth = tab.doc.depth;
         for layer in &mut tab.doc.layers {
             if matches!(layer.content, Content::Text(_) | Content::Gradient(_)) {
-                layer.rasterize(old_width, old_height);
+                layer.rasterize(old_width, old_height, depth);
             }
             if let Content::Pixels(pixels) = &mut layer.content {
                 *pixels = image(pixels);
@@ -1724,7 +1776,9 @@ impl GodApp {
             "Image Size",
             width,
             height,
-            |image| transform::resize(image, width, height, resample),
+            |raster| {
+                map_raster!(raster, image => transform::resize(image, width, height, resample))
+            },
             |mask| transform::resize_gray(mask, width, height),
         );
     }
@@ -1744,7 +1798,11 @@ impl GodApp {
             "Canvas Size",
             width,
             height,
-            |image| transform::canvas(image, width, height, anchor, [0; 4]),
+            |raster| {
+                map_raster!(raster, image => {
+                    transform::canvas(image, width, height, anchor, [0; 4])
+                })
+            },
             |mask| transform::canvas_gray(mask, width, height, anchor),
         );
         if bottom == Some(true)
@@ -1757,7 +1815,9 @@ impl GodApp {
             if let Some(Content::Pixels(image)) =
                 tab.doc.layers.first_mut().map(|layer| &mut layer.content)
             {
-                *image = transform::canvas(&original, width, height, anchor, color);
+                *image = map_raster!(&original, original => {
+                    transform::canvas(original, width, height, anchor, color)
+                });
                 tab.recomposite();
                 let step = tab.history.len() - 1;
                 tab.history.truncate(step);
@@ -1784,7 +1844,7 @@ impl GodApp {
             name,
             w,
             h,
-            |image| turned(image, turn),
+            |raster| map_raster!(raster, image => turned(image, turn)),
             |mask| turned(mask, turn),
         );
     }
@@ -1802,7 +1862,7 @@ impl GodApp {
             "Rotate Canvas",
             w,
             h,
-            |image| transform::rotate(image, angle, true, [0; 4]),
+            |raster| map_raster!(raster, image => transform::rotate(image, angle, true, [0; 4])),
             |mask| {
                 let as_rgba = gray_to_rgba(mask);
                 rgba_to_gray(&transform::rotate(&as_rgba, angle, true, [0; 4]))
@@ -1812,11 +1872,15 @@ impl GodApp {
         let tab = self.tab();
         if let Some(layer) = tab.doc.layers.first_mut()
             && layer.name == "Background"
-            && let Content::Pixels(image) = &mut layer.content
+            && let Content::Pixels(raster) = &mut layer.content
         {
-            let mut under = RgbaImage::from_pixel(w, h, image::Rgba(bg));
-            godphoto_core::blend::composite(&mut under, image, godphoto_core::Blend::Normal, 1.0);
-            *image = under;
+            with_raster!(raster, image => {
+                let mut under = image.clone();
+                paint::fill_selection(&mut under, bg, None, 1.0, godphoto_core::Blend::Normal);
+                let normal = godphoto_core::Blend::Normal;
+                godphoto_core::blend::composite(&mut under, image, normal, 1.0);
+                *image = under;
+            });
             tab.recomposite();
         }
     }
@@ -1838,7 +1902,7 @@ impl GodApp {
             "Crop",
             width,
             height,
-            |image| transform::crop(image, x, y, width, height),
+            |raster| map_raster!(raster, image => transform::crop(image, x, y, width, height)),
             |mask| transform::crop_gray(mask, x, y, width, height),
         );
     }
@@ -1849,14 +1913,15 @@ impl GodApp {
         step: &str,
         width: u32,
         height: u32,
-        image: impl Fn(&RgbaImage) -> RgbaImage,
+        image: impl Fn(&Raster) -> Raster,
         gray: impl Fn(&GrayImage) -> GrayImage,
     ) {
         let tab = self.tab();
         let (old_width, old_height) = tab.size();
+        let depth = tab.doc.depth;
         for layer in &mut tab.doc.layers {
             if matches!(layer.content, Content::Gradient(_)) {
-                layer.rasterize(old_width, old_height);
+                layer.rasterize(old_width, old_height, depth);
             }
             if let Content::Pixels(pixels) = &mut layer.content {
                 *pixels = image(pixels);
@@ -1890,26 +1955,28 @@ impl GodApp {
         let Some((x, y, w, h)) = area else {
             return;
         };
-        self.on_pixels("Transform", |image, _| {
-            let mut piece = transform::crop(image, x, y, w, h);
-            let mut cut = image.clone();
-            let inside = GrayImage::from_fn(width, height, |px, py| {
-                let hit = px >= x && px < x + w && py >= y && py < y + h;
-                image::Luma([if hit { 255 } else { 0 }])
-            });
-            for (pixel, keep) in cut.pixels_mut().zip(inside.pixels()) {
-                if keep[0] > 0 {
-                    pixel[3] = 0;
+        self.on_pixels("Transform", |raster, _| {
+            with_raster!(raster, image => {
+                let mut piece = transform::crop(image, x, y, w, h);
+                let mut cut = image.clone();
+                let inside = GrayImage::from_fn(width, height, |px, py| {
+                    let hit = px >= x && px < x + w && py >= y && py < y + h;
+                    image::Luma([if hit { 255 } else { 0 }])
+                });
+                for (pixel, keep) in cut.pixels_mut().zip(inside.pixels()) {
+                    if keep[0] > 0 {
+                        pixel[3] = Default::default();
+                    }
                 }
-            }
-            piece = turned(&piece, turn);
-            let (cx, cy) = (x as i64 + w as i64 / 2, y as i64 + h as i64 / 2);
-            let at = (
-                cx - piece.width() as i64 / 2,
-                cy - piece.height() as i64 / 2,
-            );
-            image::imageops::overlay(&mut cut, &piece, at.0, at.1);
-            *image = cut;
+                piece = turned(&piece, turn);
+                let (cx, cy) = (x as i64 + w as i64 / 2, y as i64 + h as i64 / 2);
+                let at = (
+                    cx - piece.width() as i64 / 2,
+                    cy - piece.height() as i64 / 2,
+                );
+                image::imageops::overlay(&mut cut, &piece, at.0, at.1);
+                *image = cut;
+            })
         });
     }
 
@@ -2480,6 +2547,11 @@ impl GodApp {
                     for mode in godphoto_core::ColorMode::ALL {
                         let on = tab.doc.mode == mode;
                         check(ui, clicked, mode.name(), "", on, Cmd::ModeDialog(mode));
+                    }
+                    ui.separator();
+                    for depth in Depth::ALL {
+                        let on = tab.doc.depth == depth;
+                        check(ui, clicked, depth.name(), "", on, Cmd::SetDepth(depth));
                     }
                 });
                 ui.separator();
@@ -3088,8 +3160,9 @@ impl GodApp {
         ui.horizontal(|ui| {
             let (width, height) = tab.size();
             let mut text = format!(
-                "{width} × {height} px · {:.0} ppi · {} layers",
+                "{width} × {height} px · {:.0} ppi · {} bits · {} layers",
                 tab.doc.dpi,
+                tab.doc.depth.bits(),
                 tab.doc.layers.len()
             );
             if let Some((x, y)) = self.canvas.hover {
@@ -3385,6 +3458,7 @@ fn replayable(cmd: &Cmd) -> bool {
             | Cmd::Crop { .. }
             | Cmd::Trim { .. }
             | Cmd::Grayscale
+            | Cmd::SetDepth(_)
             | Cmd::Adjust(_)
             | Cmd::AutoTone
             | Cmd::AutoContrast
@@ -3595,6 +3669,9 @@ fn palette_entries() -> Vec<(String, Cmd)> {
     }
     for mode in godphoto_core::ColorMode::ALL {
         entries.push((format!("Mode: {}", mode.name()), Cmd::ModeDialog(mode)));
+    }
+    for depth in Depth::ALL {
+        entries.push((format!("Mode: {}", depth.name()), Cmd::SetDepth(depth)));
     }
     entries
 }

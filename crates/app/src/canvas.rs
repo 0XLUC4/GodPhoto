@@ -6,7 +6,9 @@ use egui::{
 };
 use godphoto_core::paint::{self, Gradient};
 use godphoto_core::transform::{self, Affine, Resample};
-use godphoto_core::{Content, GrayImage, Layer, RgbaImage, select};
+use godphoto_core::{
+    Content, Depth, GrayImage, Layer, Raster, RgbaImage, Sample, map_raster, select, with_raster,
+};
 
 use crate::app::{Cmd, GodApp, gray_to_rgba, rgba_to_gray, to_color};
 use crate::paths::{Part, PathTarget};
@@ -812,8 +814,10 @@ impl GodApp {
                 let (x, y) = (at.x.max(0.0) as u32, at.y.max(0.0) as u32);
                 if x < width && y < height {
                     let (tolerance, contiguous) = (self.options.tolerance, self.options.contiguous);
-                    self.on_pixels("Magic Eraser", |image, _| {
-                        paint::magic_erase(image, x, y, tolerance, contiguous)
+                    self.on_pixels("Magic Eraser", |raster, _| {
+                        with_raster!(raster, image => {
+                            paint::magic_erase(image, x, y, tolerance, contiguous)
+                        })
                     });
                 }
                 None
@@ -824,10 +828,10 @@ impl GodApp {
                     let (color, tolerance, contiguous) =
                         (self.fg, self.options.tolerance, self.options.contiguous);
                     let (opacity, blend) = (self.options.brush.opacity, self.options.blend);
-                    self.on_pixels("Paint Bucket", |image, selection| {
-                        paint::fill(
+                    self.on_pixels("Paint Bucket", |raster, selection| {
+                        with_raster!(raster, image => paint::fill(
                             image, x, y, color, tolerance, contiguous, selection, opacity, blend,
-                        )
+                        ))
                     });
                 }
                 None
@@ -970,8 +974,10 @@ impl GodApp {
                 };
                 let brush = &pressed;
                 let area = match target {
-                    Target::Layer => tab.pixels_mut().and_then(|image| {
-                        stroke.to(image, at.x, at.y, pressure, brush, tool, selection.as_ref())
+                    Target::Layer => tab.pixels_mut().and_then(|raster| {
+                        with_raster!(raster, image => {
+                            stroke.to(image, at.x, at.y, pressure, brush, tool, selection.as_ref())
+                        })
                     }),
                     Target::Mask | Target::QuickMask => {
                         self.canvas.buffer.as_mut().and_then(|image| {
@@ -1165,8 +1171,10 @@ impl GodApp {
                 self.tabs[self.active].end_live();
                 self.canvas.overlay_version += 1;
                 let region = rgba_to_gray(&region);
-                self.on_pixels("Remove", |image, _| {
-                    paint::content_aware_fill(image, &region)
+                self.on_pixels("Remove", |raster, _| {
+                    with_raster!(raster, image => {
+                        paint::content_aware_fill(image, &region)
+                    })
                 });
             }
             Drag::Gradient { start } => {
@@ -1206,10 +1214,12 @@ impl GodApp {
                     dither: true,
                 };
                 let (blend, opacity) = (self.options.blend, self.options.brush.opacity);
-                self.on_pixels("Gradient", |image, _| {
-                    let mut top = RgbaImage::new(image.width(), image.height());
-                    gradient.draw(&mut top, None);
-                    godphoto_core::blend::composite(image, &top, blend, opacity);
+                self.on_pixels("Gradient", |raster, _| {
+                    with_raster!(raster, image => {
+                        let mut top = image::ImageBuffer::new(image.width(), image.height());
+                        gradient.draw(&mut top, None);
+                        godphoto_core::blend::composite(image, &top, blend, opacity);
+                    })
                 });
             }
             Drag::Shape { start } => {
@@ -1248,10 +1258,12 @@ impl GodApp {
                 };
                 let (dx, dy) = (d.x.round() as i32, d.y.round() as i32);
                 let soft = select::feather(&region, 2.0);
-                self.on_pixels("Patch", |image, _| {
-                    // The area takes the pixels found where it was dragged to.
-                    let source = transform::shift(image, -dx, -dy);
-                    godphoto_core::mix(image, &source, 1.0, Some(&soft), None);
+                self.on_pixels("Patch", |raster, _| {
+                    with_raster!(raster, image => {
+                        // The area takes the pixels found where it was dragged to.
+                        let source = transform::shift(image, -dx, -dy);
+                        godphoto_core::mix(image, &source, 1.0, Some(&soft), None);
+                    })
                 });
             }
             Drag::Freeform { mut points } => {
@@ -1318,7 +1330,10 @@ impl GodApp {
                     r
                 };
                 let region = select::ellipse(width, height, r.min.x, r.min.y, r.max.x, r.max.y);
-                self.on_pixels("Red Eye", |image, _| paint::red_eye(image, &region));
+                self.on_pixels(
+                    "Red Eye",
+                    |raster, _| with_raster!(raster, image => paint::red_eye(image, &region)),
+                );
             }
             Drag::Transform { .. } | Drag::CropCorner { .. } | Drag::CropMove { .. } => {}
             Drag::Pan { .. } | Drag::Turn { .. } => {}
@@ -1391,19 +1406,25 @@ impl GodApp {
         }
         let (width, height) = tab.size();
         tab.layer()
-            .and_then(|layer| layer.render(width, height))
+            .and_then(|layer| layer.render_as::<u8>(width, height))
             .unwrap_or_else(|| tab.composite.clone())
     }
 
     fn sample_color(&self, at: Pos2) -> Option<[u8; 4]> {
         let tab = &self.tabs[self.active];
         let (width, height) = tab.size();
-        let image = if self.options.sample_all {
-            &tab.composite
-        } else {
-            match tab.layer().map(|layer| &layer.content) {
-                Some(Content::Pixels(image)) => image,
-                _ => &tab.composite,
+        let layer = match tab.layer().map(|layer| &layer.content) {
+            Some(Content::Pixels(raster)) if !self.options.sample_all => Some(raster),
+            _ => None,
+        };
+        // The 8-bit view of a pixel.
+        let at8 = |x: u32, y: u32| -> [u8; 4] {
+            match layer {
+                Some(raster) => with_raster!(raster, image => {
+                    let p = image.get_pixel(x, y);
+                    [0, 1, 2, 3].map(|c| u8::from_unit(p[c].unit()))
+                }),
+                None => tab.composite.get_pixel(x, y).0,
             }
         };
         let (cx, cy) = (at.x.floor() as i64, at.y.floor() as i64);
@@ -1413,7 +1434,7 @@ impl GodApp {
         for y in cy - half..=cy + half {
             for x in cx - half..=cx + half {
                 if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
-                    let p = image.get_pixel(x as u32, y as u32);
+                    let p = at8(x as u32, y as u32);
                     for c in 0..4 {
                         sum[c] += p[c] as u32;
                     }
@@ -1460,6 +1481,7 @@ impl GodApp {
         };
         let tab = &mut self.tabs[self.active];
         let (width, height) = tab.size();
+        let depth = tab.doc.depth;
         match target {
             Target::Layer => {
                 let layer = tab.layer_mut()?;
@@ -1468,7 +1490,7 @@ impl GodApp {
                     return None;
                 }
                 if !matches!(layer.content, Content::Pixels(_)) {
-                    layer.rasterize(width, height);
+                    layer.rasterize(width, height, depth);
                     self.toasts.success("The layer was rasterized.");
                 }
             }
@@ -1516,24 +1538,18 @@ impl GodApp {
                 };
                 self.canvas.clone_offset = Some(offset);
                 let tab = &self.tabs[self.active];
-                let image = if self.options.sample_all {
-                    tab.composite.clone()
+                let source = if self.options.sample_all {
+                    tab.composite_raster()
                 } else {
                     tab.layer()
-                        .and_then(|layer| layer.render(width, height))
-                        .unwrap_or_default()
+                        .and_then(|layer| layer.render(width, height, depth))
+                        .unwrap_or_else(|| Raster::new(width, height, depth))
                 };
                 let offset = (offset.x, offset.y);
                 if tool == Tool::CloneStamp {
-                    paint::Tool::CloneStamp {
-                        offset,
-                        source: godphoto_core::Raster::Eight(image),
-                    }
+                    paint::Tool::CloneStamp { offset, source }
                 } else {
-                    paint::Tool::HealingBrush {
-                        offset,
-                        source: godphoto_core::Raster::Eight(image),
-                    }
+                    paint::Tool::HealingBrush { offset, source }
                 }
             }
             Tool::SpotHealing => paint::Tool::SpotHealing,
@@ -1551,11 +1567,9 @@ impl GodApp {
                     .first()
                     .and_then(|step| step.layers.get(tab.active));
                 let source = first
-                    .and_then(|layer| layer.render(width, height))
-                    .unwrap_or_else(|| tab.composite.clone());
-                paint::Tool::HistoryBrush {
-                    source: godphoto_core::Raster::Eight(source),
-                }
+                    .and_then(|layer| layer.render(width, height, depth))
+                    .unwrap_or_else(|| tab.composite_raster());
+                paint::Tool::HistoryBrush { source }
             }
             Tool::Blur => paint::Tool::Blur {
                 strength: self.options.strength / 100.0,
@@ -1601,8 +1615,8 @@ impl GodApp {
         let brush = &brush;
         let tab = &mut self.tabs[self.active];
         let area = match target {
-            Target::Layer => tab.pixels_mut().and_then(|image| {
-                stroke.to(
+            Target::Layer => tab.pixels_mut().and_then(|raster| {
+                with_raster!(raster, image => stroke.to(
                     image,
                     at.x,
                     at.y,
@@ -1610,7 +1624,7 @@ impl GodApp {
                     brush,
                     &paint_tool,
                     selection.as_ref(),
-                )
+                ))
             }),
             _ => self.canvas.buffer.as_mut().and_then(|image| {
                 stroke.to(
@@ -1741,9 +1755,10 @@ impl GodApp {
                     self.work_vector(None, Some(stroke))
                 };
                 let top = vector.render(width, height);
-                self.on_pixels("Path", |image, _| {
+                self.on_pixels("Path", |raster, _| with_raster!(raster, image => {
+                    let top = godphoto_core::depth::cast(top);
                     godphoto_core::blend::composite(image, &top, godphoto_core::Blend::Normal, 1.0);
-                });
+                }));
             }
             Request::ShapeFromPath => {
                 if !self.canvas.work.is_empty() {
@@ -1770,8 +1785,10 @@ impl GodApp {
                     } else if angle.abs() >= 135.0 {
                         angle -= 180.0 * angle.signum();
                     }
-                    self.on_pixels("Straighten", |image, _| {
-                        *image = transform::rotate(image, -angle, false, [0; 4]);
+                    self.on_pixels("Straighten", |raster, _| {
+                        with_raster!(raster, image => {
+                            *image = transform::rotate(image, -angle, false, [0; 4]);
+                        })
                     });
                     self.canvas.ruler = None;
                 }
@@ -1810,12 +1827,15 @@ impl GodApp {
             let quad = crop.map(|p| (p.x, p.y));
             let tab = &mut self.tabs[self.active];
             let (width, height) = tab.size();
+            let depth = tab.doc.depth;
             for layer in &mut tab.doc.layers {
                 if !layer.is_adjustment() && !matches!(layer.content, Content::Fill(_)) {
-                    layer.rasterize(width, height);
+                    layer.rasterize(width, height, depth);
                 }
-                if let Content::Pixels(image) = &mut layer.content {
-                    *image = transform::perspective_crop(image, quad, w, h);
+                if let Content::Pixels(raster) = &mut layer.content {
+                    *raster = map_raster!(&*raster, image => {
+                        transform::perspective_crop(image, quad, w, h)
+                    });
                 }
                 if let Some(mask) = &mut layer.mask {
                     *mask = rgba_to_gray(&transform::perspective_crop(
@@ -1859,7 +1879,7 @@ impl GodApp {
             return None;
         }
         let selected = tab.selection.is_some() && matches!(layer.content, Content::Pixels(_));
-        let mut image = layer.render(width, height)?;
+        let mut image = layer.render_as::<u8>(width, height)?;
         if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
             godphoto_core::apply_mask(&mut image, mask);
         }
@@ -1982,23 +2002,26 @@ impl GodApp {
                 let selection = tab.selection.clone();
                 let content_aware = moving.content_aware;
                 if let Some(mask) = selection {
-                    self.on_pixels_whole("Move", |image| {
-                        let mut piece = image.clone();
-                        godphoto_core::apply_mask(&mut piece, &mask);
-                        // Take the pixels out, then put them back moved.
-                        for (pixel, m) in image.pixels_mut().zip(mask.pixels()) {
-                            pixel[3] = godphoto_core::mul(pixel[3], 255 - m[0]);
-                        }
-                        if content_aware {
-                            paint::content_aware_fill(image, &mask);
-                        }
-                        let moved = transform::shift(&piece, dx, dy);
-                        godphoto_core::blend::composite(
-                            image,
-                            &moved,
-                            godphoto_core::Blend::Normal,
-                            1.0,
-                        );
+                    self.on_pixels_whole("Move", |raster| {
+                        with_raster!(raster, image => {
+                            let mut piece = image.clone();
+                            godphoto_core::apply_mask(&mut piece, &mask);
+                            // Take the pixels out, then put them back moved.
+                            for (pixel, m) in image.pixels_mut().zip(mask.pixels()) {
+                                let kept = (255 - m[0]) as f32 / 255.0;
+                                pixel[3] = Sample::from_unit(pixel[3].unit() * kept);
+                            }
+                            if content_aware {
+                                paint::content_aware_fill(image, &mask);
+                            }
+                            let moved = transform::shift(&piece, dx, dy);
+                            godphoto_core::blend::composite(
+                                image,
+                                &moved,
+                                godphoto_core::Blend::Normal,
+                                1.0,
+                            );
+                        })
                     });
                     let tab = &mut self.tabs[self.active];
                     let moved = rgba_to_gray(&transform::shift(&gray_to_rgba(&mask), dx, dy));
@@ -2017,6 +2040,7 @@ impl GodApp {
         let tab = &mut self.tabs[self.active];
         tab.hidden.clear();
         let (width, height) = tab.size();
+        let depth = tab.doc.depth;
         let c = transform.corners;
         let s = transform.source;
         if let Some(grid) = transform.warp {
@@ -2024,7 +2048,7 @@ impl GodApp {
             let tab = &mut self.tabs[self.active];
             for index in &transform.layers {
                 if let Some(layer) = tab.doc.layers.get_mut(*index) {
-                    warp_layer(layer, s, &grid, width, height);
+                    warp_layer(layer, s, &grid, (width, height, depth));
                 }
             }
             tab.active = transform.layer;
@@ -2044,7 +2068,7 @@ impl GodApp {
         let tab = &mut self.tabs[self.active];
         for index in &transform.layers {
             if let Some(layer) = tab.doc.layers.get_mut(*index) {
-                transform_layer(layer, s, c, width, height);
+                transform_layer(layer, s, c, (width, height, depth));
             }
         }
         tab.active = transform.layer;
@@ -2060,18 +2084,19 @@ impl GodApp {
         let targets = self.targets();
         let tab = &mut self.tabs[self.active];
         let (width, height) = tab.size();
+        let depth = tab.doc.depth;
         for index in targets {
             if let Some(layer) = tab.doc.layers.get_mut(index) {
-                transform_layer(layer, s, c, width, height);
+                transform_layer(layer, s, c, (width, height, depth));
             }
         }
         tab.commit("Transform Again");
     }
 
     /// Change the whole active layer (selection ignored), committing `step` after.
-    fn on_pixels_whole(&mut self, step: &str, change: impl FnOnce(&mut RgbaImage)) {
+    fn on_pixels_whole(&mut self, step: &str, change: impl FnOnce(&mut Raster)) {
         let selection = self.tabs[self.active].selection.take();
-        self.on_pixels(step, |image, _| change(image));
+        self.on_pixels(step, |raster, _| change(raster));
         let tab = &mut self.tabs[self.active];
         tab.selection = selection;
         // on_pixels committed already; the selection stays what it was.
@@ -2975,7 +3000,8 @@ fn map_point(s: Rect, c: [Pos2; 4], p: (f32, f32)) -> (f32, f32) {
 
 /// Apply the transform of rectangle `s` onto corners `c` to one layer, keeping what it
 /// holds live where it can: shapes, smart objects, type and gradients stay editable.
-fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], width: u32, height: u32) {
+fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], canvas: (u32, u32, Depth)) {
+    let (width, height, depth) = canvas;
     let parallel = ((c[0] + (c[2] - c[0])) - (c[1] + (c[3] - c[0]))).length() < 0.5;
     let affine = parallel.then(|| {
         let (w, h) = (s.width().max(1.0), s.height().max(1.0));
@@ -3022,13 +3048,13 @@ fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], width: u32, height:
         _ => {
             // Pixels (and type bent by perspective) are drawn again.
             if !matches!(layer.content, Content::Pixels(_)) {
-                layer.rasterize(width, height);
+                layer.rasterize(width, height, depth);
             }
-            if let Content::Pixels(image) = &mut layer.content {
-                *image = match &affine {
+            if let Content::Pixels(raster) = &mut layer.content {
+                *raster = map_raster!(&*raster, image => match &affine {
                     Some(m) => transform::affine(image, m, Resample::Bicubic),
                     None => transform::perspective(image, corners, source),
-                };
+                });
             }
         }
     }
@@ -3046,7 +3072,8 @@ fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], width: u32, height:
 
 /// Bend one layer by the patch `grid` laid over the rectangle `s`. Shapes and gradients
 /// stay live; other pixels are drawn again.
-fn warp_layer(layer: &mut Layer, s: Rect, grid: &[(f32, f32); 16], width: u32, height: u32) {
+fn warp_layer(layer: &mut Layer, s: Rect, grid: &[(f32, f32); 16], canvas: (u32, u32, Depth)) {
+    let (width, height, depth) = canvas;
     let source = (s.min.x, s.min.y, s.width(), s.height());
     let map = |p: (f32, f32)| {
         let u = (p.0 - s.min.x) / s.width().max(1e-3);
@@ -3063,10 +3090,10 @@ fn warp_layer(layer: &mut Layer, s: Rect, grid: &[(f32, f32); 16], width: u32, h
         Content::Group(_) | Content::GroupEnd => {}
         _ => {
             if !matches!(layer.content, Content::Pixels(_)) {
-                layer.rasterize(width, height);
+                layer.rasterize(width, height, depth);
             }
-            if let Content::Pixels(image) = &mut layer.content {
-                *image = transform::warp(image, grid, source);
+            if let Content::Pixels(raster) = &mut layer.content {
+                *raster = map_raster!(&*raster, image => transform::warp(image, grid, source));
             }
         }
     }

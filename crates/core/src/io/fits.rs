@@ -1,11 +1,12 @@
 //! FITS: a text header of 80-character cards in 2880-byte blocks, then big-endian samples.
-//! Reads 8/16/32/64-bit integer and 32/64-bit float images, grey or with 3 planes (RGB),
-//! scaled to 8 bits; writes 8-bit grey or RGB. Rows go bottom up, as FITS viewers expect.
+//! Reads 8/16/32/64-bit integer and 32/64-bit float images, grey or with 3 planes (RGB):
+//! 8-bit ones at 8 bits, other integers at 16 bits, floats at 32; writes 8-bit or 32-bit
+//! float grey or RGB. Rows go bottom up, as FITS viewers expect.
 
 use image::RgbImage;
 
 use super::check_size;
-use crate::{ColorMode, Document, Error, Result, Rgba, RgbaImage, luma};
+use crate::{ColorMode, DeepImage, Depth, Document, Error, Raster, Result, Rgba, luma};
 
 const BLOCK: usize = 2880;
 const CARD: usize = 80;
@@ -100,36 +101,41 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         zero + scale * raw
     };
     let count = pixels * planes;
-    let to_byte = byte_scale(bitpix, zero, scale, (0..count).map(sample));
-    let mut image = RgbaImage::new(width, height);
+    let to_unit = unit_scale(bitpix, zero, scale, (0..count).map(sample));
+    let mut image = DeepImage::new(width, height);
     let row = width as usize;
     for (index, pixel) in image.pixels_mut().enumerate() {
         let (x, y) = (index % row, index / row);
         // The first row in the file is the bottom one.
         let at = (height as usize - 1 - y) * row + x;
-        let value = |plane: usize| to_byte(sample(plane * pixels + at));
+        let value = |plane: usize| to_unit(sample(plane * pixels + at));
         *pixel = if planes == 3 {
-            Rgba([value(0), value(1), value(2), 255])
+            Rgba([value(0), value(1), value(2), 1.0])
         } else {
             let v = value(0);
-            Rgba([v, v, v, 255])
+            Rgba([v, v, v, 1.0])
         };
     }
-    let mut doc = Document::from_image(image);
+    let depth = match bitpix {
+        8 => Depth::Eight,
+        -32 | -64 => Depth::Float,
+        _ => Depth::Sixteen,
+    };
+    let mut doc = Document::from_raster(Raster::Deep(image), depth);
     if planes == 1 {
         doc.mode = ColorMode::Grayscale;
     }
     Ok(doc)
 }
 
-/// How samples map to 0..=255: bytes as they are, floats within 0..=1 times 255, anything
+/// How samples map to 0..=1: bytes over 255, floats within 0..=1 as they are, anything
 /// else stretched from its lowest to its highest value. Not-a-number is black.
-fn byte_scale(
+fn unit_scale(
     bitpix: i64,
     zero: f64,
     scale: f64,
     samples: impl Iterator<Item = f64>,
-) -> impl Fn(f64) -> u8 {
+) -> impl Fn(f64) -> f32 {
     let (mut low, mut high) = (f64::MAX, f64::MIN);
     if !(bitpix == 8 && zero == 0.0 && scale == 1.0) {
         for value in samples.filter(|v| v.is_finite()) {
@@ -148,11 +154,9 @@ fn byte_scale(
     };
     move |value: f64| {
         if value.is_finite() {
-            ((value - low) / (high - low) * 255.0)
-                .round()
-                .clamp(0.0, 255.0) as u8
+            ((value - low) / (high - low)).max(0.0) as f32
         } else {
-            0
+            0.0
         }
     }
 }
@@ -160,13 +164,46 @@ fn byte_scale(
 /// An 8-bit FITS file: grey (one plane of luma) or three planes R, G, B.
 pub(super) fn write(image: &RgbImage, gray: bool) -> Vec<u8> {
     let (width, height) = image.dimensions();
+    encode(width, height, gray, 8, |out, x, y, plane| {
+        let [r, g, b] = image.get_pixel(x, y).0;
+        out.push(if plane == 3 {
+            luma(r, g, b)
+        } else {
+            [r, g, b][plane]
+        });
+    })
+}
+
+/// A 32-bit float FITS file of `image` (its alpha is left out): grey or R, G, B.
+pub(super) fn write_float(image: &DeepImage, gray: bool) -> Vec<u8> {
+    let (width, height) = image.dimensions();
+    encode(width, height, gray, -32, |out, x, y, plane| {
+        let [r, g, b, _] = image.get_pixel(x, y).0;
+        let value = if plane == 3 {
+            0.299 * r + 0.587 * g + 0.114 * b
+        } else {
+            [r, g, b][plane]
+        };
+        out.extend_from_slice(&value.to_be_bytes());
+    })
+}
+
+/// The header and planes of a FITS file; `sample` appends the value of one plane (3 is
+/// grey) at one pixel.
+fn encode(
+    width: u32,
+    height: u32,
+    gray: bool,
+    bitpix: i32,
+    sample: impl Fn(&mut Vec<u8>, u32, u32, usize),
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut card = |key: &str, value: &str| {
         let line = format!("{key:<8}= {value:>20}");
         out.extend_from_slice(format!("{line:<80}").as_bytes());
     };
     card("SIMPLE", "T");
-    card("BITPIX", "8");
+    card("BITPIX", &bitpix.to_string());
     card("NAXIS", if gray { "2" } else { "3" });
     card("NAXIS1", &width.to_string());
     card("NAXIS2", &height.to_string());
@@ -179,12 +216,7 @@ pub(super) fn write(image: &RgbImage, gray: bool) -> Vec<u8> {
     for &plane in planes {
         for y in (0..height).rev() {
             for x in 0..width {
-                let [r, g, b] = image.get_pixel(x, y).0;
-                out.push(if plane == 3 {
-                    luma(r, g, b)
-                } else {
-                    [r, g, b][plane]
-                });
+                sample(&mut out, x, y, plane);
             }
         }
     }

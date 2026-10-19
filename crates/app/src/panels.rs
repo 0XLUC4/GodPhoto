@@ -648,7 +648,7 @@ impl GodApp {
         }
         let tab = &self.tabs[self.active];
         let (width, height) = tab.size();
-        let image = tab.doc.layers.get(index)?.render(width, height)?;
+        let image = tab.doc.layers.get(index)?.render_as::<u8>(width, height)?;
         let texture = thumbnail(ctx, &image, &format!("thumb-{tab_id}-{index}"));
         self.thumbs.layers.insert(key, (texture.clone(), version));
         Some(texture)

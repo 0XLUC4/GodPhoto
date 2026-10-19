@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::transform::{self, Affine, Resample};
-use crate::{Document, Filter, GrayImage, RgbaImage};
+use crate::{Document, Filter, GrayImage, Image, Raster, RgbaImage, Sample};
 
 /// A filter run on a smart object, which can be turned off or changed at any time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -17,7 +17,7 @@ pub struct SmartFilter {
 }
 
 /// What was drawn last, by version and canvas size.
-type Cache = Arc<Mutex<Option<(u64, u32, u32, Arc<RgbaImage>)>>>;
+type Cache = Arc<Mutex<Option<(u64, u32, u32, Arc<Raster>)>>>;
 
 static VERSIONS: AtomicU64 = AtomicU64::new(1);
 
@@ -75,27 +75,35 @@ impl Smart {
         )
     }
 
-    /// The smart object drawn on a clear canvas of `width` × `height`.
-    pub fn render(&self, width: u32, height: u32) -> Arc<RgbaImage> {
+    /// The smart object drawn on a clear canvas of `width` × `height`, at 8 bits.
+    pub fn render(&self, width: u32, height: u32) -> RgbaImage {
+        self.render_as(width, height)
+    }
+
+    /// The smart object drawn on a clear canvas of `width` × `height` as an image of sample
+    /// `S`: the inner document is composited at that depth.
+    pub fn render_as<S: Sample>(&self, width: u32, height: u32) -> Image<S> {
         if let Ok(cache) = self.cache.lock()
-            && let Some((version, w, h, image)) = cache.as_ref()
+            && let Some((version, w, h, raster)) = cache.as_ref()
             && (*version, *w, *h) == (self.version, width, height)
+            && raster.is_deep() != S::EIGHT
         {
-            return image.clone();
+            return (**raster).clone().into_image();
         }
-        let drawn = Arc::new(self.draw(width, height));
+        let drawn = self.draw::<S>(width, height);
         if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some((self.version, width, height, drawn.clone()));
+            let raster = Arc::new(Raster::from_image(drawn.clone()));
+            *cache = Some((self.version, width, height, raster));
         }
         drawn
     }
 
-    fn draw(&self, width: u32, height: u32) -> RgbaImage {
-        let inner = self.document.composite();
+    fn draw<S: Sample>(&self, width: u32, height: u32) -> Image<S> {
+        let inner = self.document.composite_as::<S>(None);
         // Work on a canvas big enough for both, then keep the visible part.
         let (iw, ih) = inner.dimensions();
         let (bw, bh) = (width.max(iw), height.max(ih));
-        let mut big = RgbaImage::new(bw, bh);
+        let mut big = Image::<S>::new(bw, bh);
         image::imageops::replace(&mut big, &inner, 0, 0);
         let c = self.corners;
         let (sx, sy, sw, sh) = self.source();
@@ -133,7 +141,7 @@ impl Smart {
             .filters
             .iter()
             .filter(|f| f.on)
-            .fold(None::<RgbaImage>, |image, f| {
+            .fold(None::<Image<S>>, |image, f| {
                 Some(f.filter.apply(image.as_ref().unwrap_or(&out)))
             });
         if let Some(filtered) = filtered {

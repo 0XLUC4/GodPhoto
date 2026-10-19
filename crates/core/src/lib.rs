@@ -1,7 +1,8 @@
 //! GodPhoto image model: a document of layers, composited bottom to top.
 //!
-//! Every layer covers the whole canvas, in straight (not premultiplied) RGBA, 8 bits per
-//! channel. Masks and selections are greyscale images of the same size: 255 is fully in.
+//! Every layer covers the whole canvas, in straight (not premultiplied) RGBA, at the depth of
+//! the document (8 bits per channel, or 16 and 32 bits kept as floating point). Masks and
+//! selections are greyscale images of the same size, at 8 bits: 255 is fully in.
 
 pub mod adjust;
 pub mod blend;
@@ -76,7 +77,8 @@ impl From<serde_json::Error> for Error {
 /// What a layer holds.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
-    Pixels(RgbaImage),
+    /// Pixels at the document's depth.
+    Pixels(Raster),
     /// Changes the look of everything under it; its own pixels are none.
     Adjustment(Adjustment),
     /// Live type, drawn again whenever it changes.
@@ -86,10 +88,7 @@ pub enum Content {
     /// A gradient over the whole canvas.
     Gradient(paint::Gradient),
     /// A pattern repeated over the whole canvas.
-    Pattern {
-        pattern: style::Pattern,
-        scale: f32,
-    },
+    Pattern { pattern: style::Pattern, scale: f32 },
     /// A vector shape, drawn again at any size.
     Shape(vector::Vector),
     /// A document inside the layer, with filters that stay editable.
@@ -250,8 +249,9 @@ impl Layer {
         }
     }
 
-    pub fn pixels(name: impl Into<String>, image: RgbaImage) -> Self {
-        Self::new(name, Content::Pixels(image))
+    /// A layer of pixels (8-bit or deep).
+    pub fn pixels(name: impl Into<String>, image: impl Into<Raster>) -> Self {
+        Self::new(name, Content::Pixels(image.into()))
     }
 
     pub fn is_adjustment(&self) -> bool {
@@ -262,32 +262,42 @@ impl Layer {
         Self::new(name, Content::Group(Group::default()))
     }
 
-    /// The layer's own colours over the canvas, before mask, effects and opacity.
+    /// The layer's own colours over the canvas at `depth`, before mask, effects and opacity.
     /// `None` for an adjustment or a group marker, which have no pixels of their own.
-    pub fn render(&self, width: u32, height: u32) -> Option<RgbaImage> {
+    pub fn render(&self, width: u32, height: u32, depth: Depth) -> Option<Raster> {
+        match depth {
+            Depth::Eight => self.render_as::<u8>(width, height).map(Raster::Eight),
+            _ => self.render_as::<f32>(width, height).map(Raster::Deep),
+        }
+    }
+
+    /// [`render`](Self::render) as an image of sample `S`. Type, shapes and patterns are
+    /// drawn at 8 bits; gradients and smart objects at `S`.
+    pub fn render_as<S: Sample>(&self, width: u32, height: u32) -> Option<Image<S>> {
+        let eight = |image: RgbaImage| depth::cast::<u8, S>(image);
         match &self.content {
-            Content::Pixels(image) => Some(image.clone()),
+            Content::Pixels(raster) => Some(raster.clone().into_image()),
             Content::Adjustment(_) | Content::Group(_) | Content::GroupEnd => None,
-            Content::Text(text) => Some(text.render(width, height)),
-            Content::Fill(color) => Some(RgbaImage::from_pixel(width, height, Rgba(*color))),
+            Content::Text(text) => Some(eight(text.render(width, height))),
+            Content::Fill(color) => Some(Image::<S>::from_pixel(width, height, unit::<S>(*color))),
             Content::Gradient(gradient) => {
-                let mut image = RgbaImage::new(width, height);
+                let mut image = Image::<S>::new(width, height);
                 gradient.draw(&mut image, None);
                 Some(image)
             }
             Content::Pattern { pattern, scale } => {
-                Some(RgbaImage::from_fn(width, height, |x, y| {
+                Some(eight(RgbaImage::from_fn(width, height, |x, y| {
                     Rgba(pattern.sample(x as i64, y as i64, *scale))
-                }))
+                })))
             }
-            Content::Shape(vector) => Some(vector.render(width, height)),
-            Content::Smart(smart) => Some((*smart.render(width, height)).clone()),
+            Content::Shape(vector) => Some(eight(vector.render(width, height))),
+            Content::Smart(smart) => Some(smart.render_as::<S>(width, height)),
         }
     }
 
-    /// Turn type, fills, shapes and smart objects into plain pixels.
-    pub fn rasterize(&mut self, width: u32, height: u32) {
-        if let Some(image) = self.render(width, height) {
+    /// Turn type, fills, shapes and smart objects into plain pixels at `depth`.
+    pub fn rasterize(&mut self, width: u32, height: u32, depth: Depth) {
+        if let Some(image) = self.render(width, height, depth) {
             self.content = Content::Pixels(image);
         }
     }
@@ -324,6 +334,8 @@ pub struct Document {
     /// ICC profile of the colours; `None` is sRGB.
     pub profile: Option<Vec<u8>>,
     pub slices: Vec<Slice>,
+    /// Bits per channel of every pixel layer.
+    pub depth: Depth,
 }
 
 impl Document {
@@ -345,11 +357,22 @@ impl Document {
         doc
     }
 
+    /// A document of one 8-bit layer.
     pub fn from_image(image: RgbaImage) -> Self {
+        Self::from_raster(Raster::Eight(image), Depth::Eight)
+    }
+
+    /// A document of one layer at `depth` (`raster` is converted if it is not at that depth).
+    pub fn from_raster(raster: Raster, depth: Depth) -> Self {
+        let raster = match (&raster, depth) {
+            (Raster::Eight(_), Depth::Eight) | (Raster::Deep(_), Depth::Float) => raster,
+            _ => raster.converted(depth),
+        };
         Self {
-            width: image.width(),
-            height: image.height(),
-            layers: vec![Layer::pixels("Background", image)],
+            width: raster.width(),
+            height: raster.height(),
+            depth,
+            layers: vec![Layer::pixels("Background", raster)],
             dpi: 72.0,
             guides: Vec::new(),
             channels: Vec::new(),
@@ -359,7 +382,7 @@ impl Document {
         }
     }
 
-    /// Everything seen, flattened into one image.
+    /// Everything seen, flattened into one image, at 8 bits (to show and to look at).
     pub fn composite(&self) -> RgbaImage {
         self.composite_with(None)
     }
@@ -367,7 +390,25 @@ impl Document {
     /// Like [`composite`](Self::composite), with layer `skip` left out (to show it apart,
     /// as while it is transformed).
     pub fn composite_with(&self, skip: Option<usize>) -> RgbaImage {
-        let mut out = RgbaImage::new(self.width, self.height);
+        self.composite_raster_with(skip).into_rgba8()
+    }
+
+    /// Everything seen, flattened at the document's depth.
+    pub fn composite_raster(&self) -> Raster {
+        self.composite_raster_with(None)
+    }
+
+    /// Like [`composite_raster`](Self::composite_raster), with layer `skip` left out.
+    pub fn composite_raster_with(&self, skip: Option<usize>) -> Raster {
+        match self.depth {
+            Depth::Eight => Raster::Eight(self.composite_as(skip)),
+            _ => Raster::Deep(self.composite_as(skip)),
+        }
+    }
+
+    /// Everything seen, flattened as an image of sample `S` (the layers are blended at `S`).
+    pub fn composite_as<S: Sample>(&self, skip: Option<usize>) -> Image<S> {
+        let mut out = Image::<S>::new(self.width, self.height);
         self.composite_into(&mut out, 0..self.layers.len(), skip);
         if self.mode == ColorMode::Grayscale {
             adjust::desaturate(&mut out);
@@ -375,10 +416,25 @@ impl Document {
         out
     }
 
+    /// Convert every pixel layer, and the documents inside smart objects, to `depth`.
+    pub fn set_depth(&mut self, depth: Depth) {
+        for layer in &mut self.layers {
+            match &mut layer.content {
+                Content::Pixels(raster) => *raster = raster.converted(depth),
+                Content::Smart(smart) => {
+                    smart.document.set_depth(depth);
+                    smart.touch();
+                }
+                _ => {}
+            }
+        }
+        self.depth = depth;
+    }
+
     /// Composite the layers of `range` onto `out`.
-    fn composite_into(
+    fn composite_into<S: Sample>(
         &self,
-        out: &mut RgbaImage,
+        out: &mut Image<S>,
         range: std::ops::Range<usize>,
         skip: Option<usize>,
     ) {
@@ -424,7 +480,7 @@ impl Document {
                 mix(out, &adjusted, layer.opacity, mask, clip);
                 continue;
             }
-            let Some(pixels) = layer.render(width, height) else {
+            let Some(pixels) = layer.render_as::<S>(width, height) else {
                 continue;
             };
             draw_layer(out, layer, pixels, &mut base_alpha);
@@ -432,9 +488,9 @@ impl Document {
     }
 
     /// Composite the group from its end marker `end` to its header `header`.
-    fn composite_group(
+    fn composite_group<S: Sample>(
         &self,
-        out: &mut RgbaImage,
+        out: &mut Image<S>,
         end: usize,
         header: usize,
         skip: Option<usize>,
@@ -458,13 +514,14 @@ impl Document {
             }
             return;
         }
-        let mut inside = RgbaImage::new(width, height);
+        let mut inside = Image::<S>::new(width, height);
         if let Some(board) = &info.artboard
             && let Some(color) = board.background
         {
+            let color = unit::<S>(color);
             for (x, y, pixel) in inside.enumerate_pixels_mut() {
                 if board.contains(x, y) {
-                    *pixel = Rgba(color);
+                    *pixel = color;
                 }
             }
         }
@@ -472,7 +529,7 @@ impl Document {
         if let Some(board) = &info.artboard {
             for (x, y, pixel) in inside.enumerate_pixels_mut() {
                 if !board.contains(x, y) {
-                    pixel[3] = 0;
+                    pixel[3] = S::default();
                 }
             }
         }
@@ -579,7 +636,7 @@ impl Document {
 
     /// Merge every layer into one.
     pub fn flatten(&mut self) {
-        let image = self.composite();
+        let image = self.composite_raster();
         self.layers = vec![Layer::pixels("Background", image)];
     }
 
@@ -602,7 +659,7 @@ impl Document {
             layers: vec![below, above],
             ..self.clone_empty()
         };
-        let merged = pair.composite();
+        let merged = pair.composite_raster();
         let name = self.layers[index - 1].name.clone();
         self.layers.remove(index);
         self.layers[index - 1] = Layer::pixels(name, merged);
@@ -618,7 +675,7 @@ impl Document {
             layers: self.layers[end..=header].to_vec(),
             ..self.clone_empty()
         };
-        let image = part.composite();
+        let image = part.composite_raster();
         let name = self.layers[header].name.clone();
         self.layers
             .splice(end..=header, [Layer::pixels(name, image)]);
@@ -627,7 +684,7 @@ impl Document {
 
     /// Merge the visible layers into one, at the top.
     pub fn merge_visible(&mut self) {
-        let image = self.composite();
+        let image = self.composite_raster();
         let kept: Vec<Layer> = (0..self.layers.len())
             .filter(|i| self.hidden(*i) && !self.layers[*i].content.is_group())
             .map(|i| self.layers[i].clone())
@@ -648,6 +705,7 @@ impl Document {
             mode: self.mode,
             profile: self.profile.clone(),
             slices: Vec::new(),
+            depth: self.depth,
         }
     }
 
@@ -657,10 +715,10 @@ impl Document {
         self.layers
             .iter()
             .map(|layer| {
-                let own = if matches!(layer.content, Content::Pixels(_)) {
-                    one * 4
-                } else {
-                    64
+                let own = match &layer.content {
+                    Content::Pixels(Raster::Deep(_)) => one * 16,
+                    Content::Pixels(_) => one * 4,
+                    _ => 64,
                 };
                 own + layer.mask.as_ref().map_or(0, |_| one)
             })
@@ -679,11 +737,16 @@ impl Artboard {
     }
 }
 
+/// An 8-bit colour as a pixel of sample `S`.
+pub fn unit<S: Sample>(color: [u8; 4]) -> S::Px {
+    S::rgba(color.map(|c| S::from_unit(c as f32 / 255.0)))
+}
+
 /// Put a layer's `pixels` over `out` with its mask, clipping, effects, blend and opacity.
-fn draw_layer(
-    out: &mut RgbaImage,
+fn draw_layer<S: Sample>(
+    out: &mut Image<S>,
     layer: &Layer,
-    mut pixels: RgbaImage,
+    mut pixels: Image<S>,
     base_alpha: &mut Option<GrayImage>,
 ) {
     if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
@@ -754,6 +817,26 @@ pub fn mix<S: Sample>(
         });
 }
 
+/// [`mix`] for rasters; `changed` is brought to the depth of `out` if it differs.
+pub fn mix_raster(
+    out: &mut Raster,
+    changed: &Raster,
+    opacity: f32,
+    mask: Option<&GrayImage>,
+    clip: Option<&GrayImage>,
+) {
+    match (out, changed) {
+        (Raster::Eight(out), Raster::Eight(changed)) => mix(out, changed, opacity, mask, clip),
+        (Raster::Deep(out), Raster::Deep(changed)) => mix(out, changed, opacity, mask, clip),
+        (Raster::Eight(out), Raster::Deep(changed)) => {
+            mix(out, &depth::to_rgba8(changed), opacity, mask, clip)
+        }
+        (Raster::Deep(out), Raster::Eight(changed)) => {
+            mix(out, &depth::to_deep(changed), opacity, mask, clip)
+        }
+    }
+}
+
 /// `a * b / 255`, rounded.
 pub fn mul(a: u8, b: u8) -> u8 {
     let t = a as u32 * b as u32 + 128;
@@ -790,7 +873,7 @@ mod tests {
         let mut doc = Document::new(2, 1, Background::Transparent);
         let mut shape = RgbaImage::new(2, 1);
         shape.put_pixel(0, 0, Rgba([0, 0, 255, 255]));
-        doc.layers[0].content = Content::Pixels(shape);
+        doc.layers[0].content = Content::Pixels(Raster::Eight(shape));
         let mut over = Layer::new("Fill", Content::Fill([255, 0, 0, 255]));
         over.clipped = true;
         doc.layers.push(over);
@@ -852,6 +935,73 @@ mod tests {
         assert_eq!(out.get_pixel(0, 0)[3], 0);
         assert_eq!(out.get_pixel(1, 0), &Rgba([0, 0, 255, 255]));
         assert_eq!(out.get_pixel(3, 0)[3], 0);
+    }
+
+    /// Distinct red values of a gradient under a Levels layer, composited at `depth`.
+    fn levels_over_gradient(depth: Depth) -> usize {
+        let mut doc = Document::new(3000, 1, Background::White);
+        doc.set_depth(depth);
+        let mut gradient = paint::Gradient::two([0, 0, 0, 255], [255, 255, 255, 255]);
+        gradient.end = (3000.0, 0.0);
+        gradient.dither = false;
+        doc.layers
+            .push(Layer::new("Gradient", Content::Gradient(gradient)));
+        let levels = adjust::Levels {
+            in_white: 200,
+            gamma: 1.6,
+            ..adjust::Levels::default()
+        };
+        doc.layers.push(Layer::new(
+            "Levels",
+            Content::Adjustment(Adjustment::Levels {
+                channels: [
+                    levels,
+                    adjust::Levels::default(),
+                    adjust::Levels::default(),
+                    adjust::Levels::default(),
+                ],
+            }),
+        ));
+        let raster = doc.composite_raster();
+        assert_eq!(raster.is_deep(), depth.deep());
+        let reds: std::collections::HashSet<u32> = raster
+            .to_deep()
+            .pixels()
+            .map(|p| (p[0] * 65535.0).round() as u32)
+            .collect();
+        reds.len()
+    }
+
+    #[test]
+    fn deep_documents_keep_their_precision() {
+        assert!(levels_over_gradient(Depth::Sixteen) > 256);
+        assert!(levels_over_gradient(Depth::Float) > 256);
+        assert!(levels_over_gradient(Depth::Eight) <= 256);
+    }
+
+    #[test]
+    fn set_depth_converts_layers_and_merges_keep_it() {
+        let mut doc = Document::new(2, 1, Background::White);
+        doc.layers.push(Layer::pixels(
+            "Red",
+            RgbaImage::from_pixel(2, 1, Rgba([255, 0, 0, 128])),
+        ));
+        let eight = doc.composite();
+        doc.set_depth(Depth::Sixteen);
+        assert!(matches!(
+            doc.layers[1].content,
+            Content::Pixels(Raster::Deep(_))
+        ));
+        assert_eq!(doc.composite(), eight);
+        assert!(doc.merge_down(1));
+        assert!(matches!(
+            doc.layers[0].content,
+            Content::Pixels(Raster::Deep(_))
+        ));
+        assert_eq!(doc.weight(), 2 * 16);
+        doc.set_depth(Depth::Eight);
+        assert_eq!(doc.composite(), eight);
+        assert_eq!(doc.weight(), 2 * 4);
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! PSD and PSB: read layers, groups (or the merged image) in RGB, greyscale, indexed, CMYK,
-//! Lab and bitmap at 1, 8, 16 or 32 bits, with the ICC profile; write 8-bit PSD in RGB,
-//! greyscale, CMYK or Lab (after the document's mode) with layers, groups, masks, the
-//! profile and the merged image. Layers without pixels of their own (type, shapes, fills,
-//! smart objects) are written as pixels; adjustments are left out.
+//! Lab and bitmap at 1, 8, 16 or 32 bits (16 and 32-bit files open as 16 and 32-bit
+//! documents), with the ICC profile; write PSD in RGB, greyscale, CMYK or Lab (after the
+//! document's mode) with layers, groups, masks, the profile and the merged image, at 8 bits,
+//! or at 16 and 32 bits for deep RGB and greyscale documents. Layers without pixels of their
+//! own (type, shapes, fills, smart objects) are written as pixels; adjustments are left out.
 
 use super::{check_layers, check_size, unit};
 use crate::color::{self, Intent, Profile};
 use crate::{
-    Blend, ColorMode, Content, Document, Error, GrayImage, Group, Layer, Result, RgbaImage,
+    Blend, ColorMode, Content, DeepImage, Depth, Document, Error, GrayImage, Group, Image, Layer,
+    Raster, Result, RgbaImage, Sample,
 };
 
 /// Blend keys and the blend each stands for.
@@ -204,15 +206,11 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         psb,
         cmyk,
     };
-    let section = r.len(psb)?;
-    let mut section = r.sub(section)?;
-    // A layer section we cannot read (ZIP-compressed channels, damage) falls back to the merged image.
-    let (layers, merged_alpha) = layer_section(&mut section, &info).unwrap_or((Vec::new(), None));
-    let layers = if layers.is_empty() {
-        let image = merged(&mut r, &info, channels, merged_alpha.unwrap_or(true))?;
-        vec![Layer::pixels("Background", image)]
-    } else {
-        layers
+    // Deep files keep their samples as floating point.
+    let (layers, depth) = match depth {
+        16 => (content::<f32>(&mut r, &info, channels)?, Depth::Sixteen),
+        32 => (content::<f32>(&mut r, &info, channels)?, Depth::Float),
+        _ => (content::<u8>(&mut r, &info, channels)?, Depth::Eight),
     };
     let mode = match mode {
         Mode::Cmyk => ColorMode::Cmyk,
@@ -230,7 +228,23 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         dpi,
         guides: Vec::new(),
         channels: Vec::new(),
+        depth,
     })
+}
+
+/// The layers, or the merged image when they cannot be read, as samples `S`.
+fn content<S: Sample>(r: &mut Reader, info: &Info, channels: usize) -> Result<Vec<Layer>> {
+    let section = r.len(info.psb)?;
+    let mut section = r.sub(section)?;
+    // A layer section we cannot read (ZIP-compressed channels, damage) falls back to the
+    // merged image.
+    let (layers, merged_alpha) =
+        layer_section::<S>(&mut section, info).unwrap_or((Vec::new(), None));
+    if !layers.is_empty() {
+        return Ok(layers);
+    }
+    let image = merged::<S>(r, info, channels, merged_alpha.unwrap_or(true))?;
+    Ok(vec![Layer::pixels("Background", Raster::from_image(image))])
 }
 
 /// Pixels per inch (resolution info, id 0x03ED; 72 when missing) and the ICC profile
@@ -272,10 +286,10 @@ fn resource<'a>(r: &mut Reader<'a>) -> Result<(u16, &'a [u8])> {
 }
 
 /// The layers (bottom first), and whether the merged image's extra channel is transparency.
-fn layer_section(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)> {
+fn layer_section<S: Sample>(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)> {
     let length = r.len(info.psb)?;
     if length > 0 {
-        let found = layer_info(&mut r.sub(length)?, info)?;
+        let found = layer_info::<S>(&mut r.sub(length)?, info)?;
         if !found.0.is_empty() {
             return Ok(found);
         }
@@ -292,7 +306,7 @@ fn layer_section(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool
         let length = r.len(info.psb && LONG_KEYS.contains(&&key))?;
         let mut block = r.sub(length)?;
         if matches!(&key, b"Lr16" | b"Lr32" | b"Layr") {
-            return layer_info(&mut block, info);
+            return layer_info::<S>(&mut block, info);
         }
         // Some writers pad blocks to 4 bytes without counting it.
         while r.rest() > 0 && r.bytes[r.pos] != b'8' {
@@ -352,11 +366,16 @@ impl Rect {
     }
 }
 
-fn layer_info(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)> {
+fn layer_info<S: Sample>(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)> {
     let count = r.i16()?;
     let merged_alpha = count < 0;
     let count = count.unsigned_abs() as usize;
-    check_layers(count, info.width, info.height)?;
+    // Deep layers take four times the memory.
+    check_layers(
+        count * if S::EIGHT { 1 } else { 4 },
+        info.width,
+        info.height,
+    )?;
     let records = (0..count)
         .map(|_| record(r, info.psb))
         .collect::<Result<Vec<_>>>()?;
@@ -370,7 +389,7 @@ fn layer_info(r: &mut Reader, info: &Info) -> Result<(Vec<Layer>, Option<bool>)>
                 _ => record.rect,
             };
             let (width, height) = rect.size()?;
-            planes.push((id, channel(data, width, height, info)?));
+            planes.push((id, channel::<S>(data, width, height, info)?));
         }
         layers.push(build(&record, &planes, info)?);
     }
@@ -500,7 +519,7 @@ fn unicode_name(r: &mut Reader) -> Option<String> {
 }
 
 /// One full-canvas layer (or group marker) from a record and its decoded channels.
-fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Layer> {
+fn build<S: Sample>(record: &Record, planes: &[(i16, Vec<S>)], info: &Info) -> Result<Layer> {
     let plane = |id: i16| {
         planes
             .iter()
@@ -526,15 +545,16 @@ fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Laye
                 plane(-1),
                 width * height,
             );
-            let mut pixels = RgbaImage::new(info.width, info.height);
+            let mut pixels = Image::<S>::new(info.width, info.height);
             place(&mut pixels, info.width, &rgba, width, record.rect, 4);
-            Layer::pixels(record.name.clone(), pixels)
+            Layer::pixels(record.name.clone(), Raster::from_image(pixels))
         }
     };
     if let (Some((rect, default, flags)), Some(mask)) = (record.mask, plane(-2)) {
         let (mask_width, _) = rect.size()?;
+        let mask: Vec<u8> = mask.iter().map(|v| u8::from_unit(v.unit())).collect();
         let mut canvas = GrayImage::from_pixel(info.width, info.height, image::Luma([default]));
-        place(&mut canvas, info.width, mask, mask_width, rect, 1);
+        place(&mut canvas, info.width, &mask, mask_width, rect, 1);
         layer.mask = Some(canvas);
         layer.mask_on = flags & 2 == 0;
     }
@@ -551,10 +571,10 @@ fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Laye
 }
 
 /// Copy `src` (`src_width` wide, `bpp` bytes a pixel) into the canvas at `rect`, clipped.
-fn place(
-    canvas: &mut [u8],
+fn place<T: Copy>(
+    canvas: &mut [T],
     canvas_width: u32,
-    src: &[u8],
+    src: &[T],
     src_width: usize,
     rect: Rect,
     bpp: usize,
@@ -581,10 +601,22 @@ fn place(
     }
 }
 
-/// Straight RGBA from the decoded 8-bit channels of a colour mode.
-fn to_rgba(info: &Info, color: [Option<&[u8]>; 4], alpha: Option<&[u8]>, n: usize) -> Vec<u8> {
-    let at = |plane: Option<&[u8]>, i: usize, default: u8| {
-        plane.and_then(|p| p.get(i)).copied().unwrap_or(default)
+/// Straight RGBA from the decoded channels of a colour mode. CMYK and Lab convert through
+/// 8 bits.
+fn to_rgba<S: Sample>(
+    info: &Info,
+    color: [Option<&[S]>; 4],
+    alpha: Option<&[S]>,
+    n: usize,
+) -> Vec<S> {
+    let at = |plane: Option<&[S]>, i: usize| plane.and_then(|p| p.get(i)).copied();
+    let byte = |plane: Option<&[S]>, i: usize, default: u8| {
+        at(plane, i).map_or(default, |v| u8::from_unit(v.unit()))
+    };
+    let deep = |raw: Vec<u8>| -> Vec<S> {
+        raw.into_iter()
+            .map(|v| S::from_unit(v as f32 / 255.0))
+            .collect()
     };
     // The conversions work on images: the pixels go in as one row.
     let row = u32::try_from(n).unwrap_or(0);
@@ -592,42 +624,44 @@ fn to_rgba(info: &Info, color: [Option<&[u8]>; 4], alpha: Option<&[u8]>, n: usiz
         // CMYK is stored inverted: 255 is no ink.
         Mode::Cmyk => {
             let inks: Vec<[u8; 4]> = (0..n)
-                .map(|i| [0, 1, 2, 3].map(|k| 255 - at(color[k], i, 255)))
+                .map(|i| [0, 1, 2, 3].map(|k| 255 - byte(color[k], i, 255)))
                 .collect();
             let srgb = Profile::srgb();
-            color::cmyk_to_rgb(&inks, row, 1, &info.cmyk, &srgb, Intent::default()).into_raw()
+            deep(color::cmyk_to_rgb(&inks, row, 1, &info.cmyk, &srgb, Intent::default()).into_raw())
         }
         Mode::Lab => {
             let lab: Vec<[u8; 3]> = (0..n)
                 .map(|i| {
                     [
-                        at(color[0], i, 0),
-                        at(color[1], i, 128),
-                        at(color[2], i, 128),
+                        byte(color[0], i, 0),
+                        byte(color[1], i, 128),
+                        byte(color[2], i, 128),
                     ]
                 })
                 .collect();
-            color::lab_to_image(&lab, row, 1, &Profile::srgb()).into_raw()
+            deep(color::lab_to_image(&lab, row, 1, &Profile::srgb()).into_raw())
         }
         _ => (0..n)
             .flat_map(|i| {
-                let c = |k: usize| at(color[k], i, 0);
+                let c = |k: usize| at(color[k], i).unwrap_or_default();
                 let [r, g, b] = match info.mode {
                     Mode::Rgb => [c(0), c(1), c(2)],
                     Mode::Indexed => {
-                        let index = c(0) as usize;
-                        [0, 256, 512]
-                            .map(|offset| info.palette.get(offset + index).copied().unwrap_or(0))
+                        let index = byte(color[0], i, 0) as usize;
+                        [0, 256, 512].map(|offset| {
+                            let v = info.palette.get(offset + index).copied().unwrap_or(0);
+                            S::from_unit(v as f32 / 255.0)
+                        })
                     }
                     _ => [c(0); 3],
                 };
-                [r, g, b, 255]
+                [r, g, b, S::MAX]
             })
             .collect(),
     };
-    out.resize(n * 4, 255);
+    out.resize(n * 4, S::MAX);
     for (i, pixel) in out.chunks_exact_mut(4).enumerate() {
-        pixel[3] = at(alpha, i, 255);
+        pixel[3] = at(alpha, i).unwrap_or(S::MAX);
     }
     out
 }
@@ -636,8 +670,8 @@ fn row_bytes(width: usize, depth: u16) -> usize {
     (width * depth as usize).div_ceil(8)
 }
 
-/// One layer channel (compression word + data) as 8-bit samples.
-fn channel(data: &[u8], width: usize, height: usize, info: &Info) -> Result<Vec<u8>> {
+/// One layer channel (compression word + data) as samples `S`.
+fn channel<S: Sample>(data: &[u8], width: usize, height: usize, info: &Info) -> Result<Vec<S>> {
     if data.is_empty() || width * height == 0 {
         return Ok(Vec::new());
     }
@@ -655,7 +689,7 @@ fn channel(data: &[u8], width: usize, height: usize, info: &Info) -> Result<Vec<
             ));
         }
     };
-    Ok(to_8bit(&raw, width, height, info.depth))
+    Ok(to_samples(&raw, width, height, info.depth))
 }
 
 fn row_counts(r: &mut Reader, rows: usize, psb: bool) -> Result<Vec<usize>> {
@@ -706,37 +740,54 @@ fn unpack(input: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Samples of any depth as 8 bits, exactly `width * height` of them.
-fn to_8bit(raw: &[u8], width: usize, height: usize, depth: u16) -> Vec<u8> {
-    let mut out: Vec<u8> = match depth {
+/// Samples of any depth as samples `S`, exactly `width * height` of them.
+fn to_samples<S: Sample>(raw: &[u8], width: usize, height: usize, depth: u16) -> Vec<S> {
+    let mut out: Vec<S> = match depth {
         1 => {
             let row = row_bytes(width, 1);
             (0..width * height)
                 .map(|i| {
                     let (y, x) = (i / width, i % width);
                     let byte = raw.get(y * row + x / 8).copied().unwrap_or(0);
-                    if byte >> (7 - x % 8) & 1 == 1 { 0 } else { 255 }
+                    if byte >> (7 - x % 8) & 1 == 1 {
+                        S::default()
+                    } else {
+                        S::MAX
+                    }
                 })
                 .collect()
         }
         16 => raw
             .chunks_exact(2)
-            .map(|c| ((u16::from_be_bytes([c[0], c[1]]) as u32 + 128) / 257) as u8)
+            .map(|c| S::from_unit(u16::from_be_bytes([c[0], c[1]]) as f32 / 65535.0))
             .collect(),
         32 => raw
             .chunks_exact(4)
-            .map(|c| {
-                (f32::from_be_bytes([c[0], c[1], c[2], c[3]]).clamp(0.0, 1.0) * 255.0).round() as u8
-            })
+            .map(|c| S::from_unit(f32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             .collect(),
-        _ => raw.to_vec(),
+        _ => {
+            // 8-bit samples into 8-bit samples: a plain copy.
+            let any: Box<dyn std::any::Any> = Box::new(raw.to_vec());
+            match any.downcast::<Vec<S>>() {
+                Ok(same) => *same,
+                Err(_) => raw
+                    .iter()
+                    .map(|&v| S::from_unit(v as f32 / 255.0))
+                    .collect(),
+            }
+        }
     };
-    out.resize(width * height, 0);
+    out.resize(width * height, S::default());
     out
 }
 
 /// The merged image at the end of the file.
-fn merged(r: &mut Reader, info: &Info, channels: usize, alpha: bool) -> Result<RgbaImage> {
+fn merged<S: Sample>(
+    r: &mut Reader,
+    info: &Info,
+    channels: usize,
+    alpha: bool,
+) -> Result<Image<S>> {
     let (width, height) = (info.width as usize, info.height as usize);
     let colors = info.mode.colors();
     let wanted = channels.min(colors + usize::from(alpha));
@@ -757,9 +808,9 @@ fn merged(r: &mut Reader, info: &Info, channels: usize, alpha: bool) -> Result<R
             ));
         }
     };
-    let planes: Vec<Vec<u8>> = raw
+    let planes: Vec<Vec<S>> = raw
         .iter()
-        .map(|p| to_8bit(p, width, height, info.depth))
+        .map(|p| to_samples(p, width, height, info.depth))
         .collect();
     let plane = |k: usize| planes.get(k).map(Vec::as_slice);
     let color = std::array::from_fn(|k| if k < colors { plane(k) } else { None });
@@ -769,7 +820,7 @@ fn merged(r: &mut Reader, info: &Info, channels: usize, alpha: bool) -> Result<R
         None
     };
     let rgba = to_rgba(info, color, alpha, width * height);
-    RgbaImage::from_raw(info.width, info.height, rgba).ok_or_else(damaged)
+    Image::<S>::from_raw(info.width, info.height, rgba).ok_or_else(damaged)
 }
 
 /// The colour space a PSD is written in.
@@ -815,10 +866,23 @@ impl Space {
             }
         }
     }
+
+    /// The colour channels of a deep `image` in RGB or grey (the spaces written deep).
+    fn deep_planes(&self, image: &DeepImage) -> Vec<Vec<f32>> {
+        match self {
+            Self::Gray => {
+                let mut gray = image.clone();
+                crate::adjust::desaturate(&mut gray);
+                vec![plane(&gray, 0)]
+            }
+            _ => (0..3).map(|c| plane(image, c)).collect(),
+        }
+    }
 }
 
-/// 8-bit PSD (version 1) in the document's colour mode (indexed and bitmap as RGB) with
-/// every layer that has pixels, groups, masks, the profile and the merged image.
+/// PSD (version 1) in the document's colour mode (indexed and bitmap as RGB) with every
+/// layer that has pixels, groups, masks, the profile and the merged image. 16 and 32-bit
+/// RGB and grey documents are written at their depth; CMYK and Lab at 8 bits.
 pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     let (width, height) = (doc.width, doc.height);
     check_size(width, height)?;
@@ -840,6 +904,11 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
         Space::Rgb => fits(false),
     }
     .filter(|icc| !icc.is_empty());
+    let bits: u16 = match (doc.depth, &space) {
+        (Depth::Sixteen, Space::Rgb | Space::Gray) => 16,
+        (Depth::Float, Space::Rgb | Space::Gray) => 32,
+        _ => 8,
+    };
 
     let colors = space.planes(&RgbaImage::new(1, 1)).len();
     let mut out = Vec::new();
@@ -849,14 +918,34 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     put16(&mut out, colors as u16 + 1);
     put32(&mut out, height);
     put32(&mut out, width);
-    put16(&mut out, 8);
+    put16(&mut out, bits);
     put16(&mut out, space.code());
     put32(&mut out, 0); // no colour mode data
     let resources = image_resources_bytes(doc.dpi, icc.as_deref())?;
     put32(&mut out, resources.len() as u32);
     out.extend_from_slice(&resources);
 
-    let info = layers(doc, &space)?;
+    let mut info = layers(doc, &space, bits)?;
+    if bits > 8 {
+        // Deep layers go in a tagged block after an empty layer info and global mask.
+        info.resize(info.len().next_multiple_of(4), 0);
+        let section = 4 + 4 + 12 + info.len();
+        put32(&mut out, u32::try_from(section).map_err(|_| too_big())?);
+        put32(&mut out, 0);
+        put32(&mut out, 0);
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(if bits == 16 { b"Lr16" } else { b"Lr32" });
+        put32(&mut out, info.len() as u32);
+        out.extend_from_slice(&info);
+        let composite = doc.composite_as::<f32>(None);
+        put16(&mut out, 0); // raw
+        let mut planes = space.deep_planes(&composite);
+        planes.push(plane(&composite, 3));
+        for plane in &planes {
+            out.extend_from_slice(&be_samples(plane, bits));
+        }
+        return Ok(out);
+    }
     let section = 4 + info.len() + 4;
     put32(&mut out, u32::try_from(section).map_err(|_| too_big())?);
     put32(&mut out, info.len() as u32);
@@ -910,8 +999,9 @@ fn too_big() -> Error {
 /// Channel ids and their encoded data.
 type Channels = Vec<(i16, Vec<u8>)>;
 
-/// The layer info block: count, records, then every channel's data.
-fn layers(doc: &Document, space: &Space) -> Result<Vec<u8>> {
+/// The layer info block: count, records, then every channel's data (PackBits at 8 bits,
+/// raw at 16 and 32).
+fn layers(doc: &Document, space: &Space, bits: u16) -> Result<Vec<u8>> {
     let (width, height) = (doc.width, doc.height);
     let colors = space.planes(&RgbaImage::new(1, 1)).len() as i16;
     let mut entries: Vec<(&Layer, Channels)> = Vec::new();
@@ -919,8 +1009,17 @@ fn layers(doc: &Document, space: &Space) -> Result<Vec<u8>> {
         let channels = if layer.content.is_group() {
             // Group markers have no pixels: every channel is raw and empty.
             (-1..colors).map(|id| (id, vec![0, 0])).collect()
+        } else if bits > 8 {
+            let Some(pixels) = layer.render_as::<f32>(width, height) else {
+                continue; // adjustments have no pixels to store
+            };
+            let mut channels = vec![(-1, raw_channel(&plane(&pixels, 3), bits))];
+            for (id, plane) in space.deep_planes(&pixels).iter().enumerate() {
+                channels.push((id as i16, raw_channel(plane, bits)));
+            }
+            channels
         } else {
-            let Some(pixels) = layer.render(width, height) else {
+            let Some(pixels) = layer.render_as::<u8>(width, height) else {
                 continue; // adjustments have no pixels to store
             };
             let mut channels = vec![(-1, rle_channel(&plane(&pixels, 3), width as usize))];
@@ -938,7 +1037,13 @@ fn layers(doc: &Document, space: &Space) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     for (layer, mut channels) in entries {
         if let Some(mask) = &layer.mask {
-            channels.push((-2, rle_channel(mask.as_raw(), width as usize)));
+            let data = if bits > 8 {
+                let unit: Vec<f32> = mask.iter().map(|&m| m as f32 / 255.0).collect();
+                raw_channel(&unit, bits)
+            } else {
+                rle_channel(mask.as_raw(), width as usize)
+            };
+            channels.push((-2, data));
         }
         write_record(&mut records, layer, &channels, width, height)?;
         for (_, bytes) in channels {
@@ -1053,8 +1158,27 @@ fn write_record(
 }
 
 /// Channel `c` of an RGBA image.
-fn plane(image: &RgbaImage, c: usize) -> Vec<u8> {
+fn plane<S: Sample>(image: &Image<S>, c: usize) -> Vec<S> {
     image.as_raw().iter().skip(c).step_by(4).copied().collect()
+}
+
+/// Samples at 16 bits (clamped to 0..=1) or 32-bit floats, big-endian.
+fn be_samples(plane: &[f32], bits: u16) -> Vec<u8> {
+    if bits == 16 {
+        plane
+            .iter()
+            .flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes())
+            .collect()
+    } else {
+        plane.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+}
+
+/// A raw layer channel: compression word 0, then the samples.
+fn raw_channel(plane: &[f32], bits: u16) -> Vec<u8> {
+    let mut out = vec![0, 0];
+    out.extend_from_slice(&be_samples(plane, bits));
+    out
 }
 
 /// A layer channel: compression word 1 (PackBits), row counts, rows.
@@ -1113,9 +1237,9 @@ mod tests {
 
     fn sample() -> Document {
         let mut doc = Document::new(7, 5, Background::Transparent);
-        doc.layers[0].content = Content::Pixels(RgbaImage::from_fn(7, 5, |x, y| {
+        doc.layers[0].content = Content::Pixels(Raster::Eight(RgbaImage::from_fn(7, 5, |x, y| {
             Rgba([x as u8 * 30, y as u8 * 50, 90, if x == 0 { 0 } else { 255 }])
-        }));
+        })));
         let mut top = RgbaImage::new(7, 5);
         for x in 2..6 {
             top.put_pixel(x, 2, Rgba([250, 20, 120, 180]));
@@ -1165,7 +1289,7 @@ mod tests {
         assert_eq!(back.layers.len(), 1);
         assert_eq!(
             back.layers[0].content,
-            Content::Pixels(sample().composite())
+            Content::Pixels(Raster::Eight(sample().composite()))
         );
     }
 
@@ -1211,7 +1335,11 @@ mod tests {
         // The fill layer comes back as its pixels.
         assert_eq!(
             back.layers[4].content,
-            Content::Pixels(RgbaImage::from_pixel(4, 3, Rgba([200, 10, 10, 128])))
+            Content::Pixels(Raster::Eight(RgbaImage::from_pixel(
+                4,
+                3,
+                Rgba([200, 10, 10, 128])
+            )))
         );
         assert_eq!(back.group_header(1), Some(6));
         assert_eq!(back.group_header(3), Some(5));
@@ -1244,7 +1372,7 @@ mod tests {
     /// Write `doc` in `mode`, read it back, and check the composite stays within `tolerance`.
     fn mode_round_trip(mode: ColorMode, tolerance: u8) -> Document {
         let mut doc = Document::new(6, 2, Background::Transparent);
-        doc.layers[0].content = Content::Pixels(RgbaImage::from_fn(6, 2, |x, y| {
+        doc.layers[0].content = Content::Pixels(Raster::Eight(RgbaImage::from_fn(6, 2, |x, y| {
             let shades = [
                 [200, 60, 40],
                 [40, 160, 90],
@@ -1255,7 +1383,7 @@ mod tests {
             ];
             let [r, g, b] = shades[x as usize];
             Rgba([r, g, b, if y == 0 { 255 } else { 120 }])
-        }));
+        })));
         doc.mode = mode;
         let back = read(&write(&doc).unwrap()).unwrap();
         assert_eq!(back.mode, mode);

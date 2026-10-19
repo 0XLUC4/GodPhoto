@@ -1,5 +1,6 @@
 //! Opening and saving documents: the native file, OpenRaster, PSD/PSB, KRA, PDN, SVG,
-//! FITS and flat images.
+//! FITS and flat images. 16-bit and floating point files open at their depth; formats that
+//! hold only 8 bits save the 8-bit view of a deeper document.
 
 mod fits;
 mod kra;
@@ -26,7 +27,11 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::color::{self, Intent, Profile};
-use crate::{ColorMode, Document, Error, Result, RgbaImage, luma, mul};
+use crate::transform::{self, Resample};
+use crate::{
+    ColorMode, DeepImage, Depth, Document, Error, Image, Raster, Result, RgbaImage, Sample, luma,
+    mul,
+};
 
 /// Longest side accepted when opening or saving.
 const MAX_SIDE: u32 = 30_000;
@@ -183,6 +188,22 @@ impl Format {
         self != Self::Avif
     }
 
+    /// Saves more than 8 bits per channel (16 bits, or floating point for EXR, HDR, FITS,
+    /// and TIFF and PSD of 32-bit documents); the others save the 8-bit view.
+    pub fn keeps_depth(self) -> bool {
+        matches!(
+            self,
+            Self::Native
+                | Self::OpenRaster
+                | Self::Psd
+                | Self::Png
+                | Self::Tiff
+                | Self::Exr
+                | Self::Hdr
+                | Self::Fits
+        )
+    }
+
     fn image_format(self) -> Option<ImageFormat> {
         Some(match self {
             Self::Native
@@ -270,7 +291,8 @@ pub fn open_bytes(bytes: &[u8], format: Option<Format>) -> Result<Document> {
 fn open_flat(bytes: &[u8], format: Format) -> Result<Document> {
     let (image, icc) = decode_with_profile(bytes, format.image_format())?;
     let gray = !image.color().has_color();
-    let mut doc = Document::from_image(image.to_rgba8());
+    let (raster, depth) = raster_of(image);
+    let mut doc = Document::from_raster(raster, depth);
     if gray {
         doc.mode = ColorMode::Grayscale;
     }
@@ -318,14 +340,153 @@ pub fn encode(doc: &Document, format: Format, options: &SaveOptions) -> Result<V
             "{} files cannot be saved",
             format.label()
         ))),
-        _ => encode_flat(
-            &doc.composite(),
-            format,
-            options,
-            doc.mode,
-            doc.profile.as_deref(),
+        _ => match doc.composite_raster() {
+            // CMYK TIFF stays 8 bits.
+            Raster::Deep(deep)
+                if format.keeps_depth()
+                    && !(format == Format::Tiff && doc.mode == ColorMode::Cmyk) =>
+            {
+                encode_deep(
+                    &deep,
+                    format,
+                    options,
+                    doc.mode,
+                    doc.depth,
+                    doc.profile.as_deref(),
+                )
+            }
+            raster => encode_flat(
+                &raster.into_rgba8(),
+                format,
+                options,
+                doc.mode,
+                doc.profile.as_deref(),
+            ),
+        },
+    }
+}
+
+/// A deep image encoded as `format` (PNG, TIFF, EXR, HDR or FITS): 16 bits per channel, or
+/// floating point for EXR, HDR, FITS and the TIFF of a 32-bit document.
+fn encode_deep(
+    image: &DeepImage,
+    format: Format,
+    options: &SaveOptions,
+    mode: ColorMode,
+    depth: Depth,
+    profile: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let image = scaled(image, options.scale)?;
+    let (width, height) = image.dimensions();
+    let gray = mode == ColorMode::Grayscale;
+    // The TIFF writer has no grey with alpha.
+    let alpha = options.transparency && format.has_alpha() && !(gray && format == Format::Tiff);
+    let flat = if alpha {
+        image.into_owned()
+    } else {
+        flatten_deep(&image)
+    };
+    let mut out = Cursor::new(Vec::new());
+    match format {
+        Format::Fits => return Ok(fits::write_float(&flat, gray)),
+        Format::Exr => DynamicImage::ImageRgba32F(flat).write_to(&mut out, ImageFormat::OpenExr)?,
+        Format::Hdr => DynamicImage::ImageRgb32F(DynamicImage::ImageRgba32F(flat).into_rgb32f())
+            .write_to(&mut out, ImageFormat::Hdr)?,
+        _ => {
+            let mut samples = Vec::with_capacity(width as usize * height as usize * 4);
+            for pixel in flat.pixels() {
+                let [r, g, b, a] = pixel.0;
+                if gray {
+                    samples.push(0.299 * r + 0.587 * g + 0.114 * b);
+                } else {
+                    samples.extend([r, g, b]);
+                }
+                if alpha {
+                    samples.push(a);
+                }
+            }
+            let float = format == Format::Tiff && depth == Depth::Float && !gray;
+            let (bytes, color) = if float {
+                let bytes = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let color = if alpha {
+                    ExtendedColorType::Rgba32F
+                } else {
+                    ExtendedColorType::Rgb32F
+                };
+                (bytes, color)
+            } else {
+                let color = match (gray, alpha) {
+                    (true, true) => ExtendedColorType::La16,
+                    (true, false) => ExtendedColorType::L16,
+                    (false, true) => ExtendedColorType::Rgba16,
+                    (false, false) => ExtendedColorType::Rgb16,
+                };
+                (samples16(&samples), color)
+            };
+            let icc = profile
+                .filter(|icc| profile_fits(icc, gray))
+                .map(<[u8]>::to_vec);
+            write_flat(&mut out, format, 100, (&bytes, width, height, color), icc)?;
+        }
+    }
+    Ok(out.into_inner())
+}
+
+/// Floating point samples as 16-bit ones (clamped to 0..=1), in native byte order as the
+/// encoders take them.
+fn samples16(samples: &[f32]) -> Vec<u8> {
+    samples
+        .iter()
+        .flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes())
+        .collect()
+}
+
+/// The depth a decoded image has: 16-bit samples are Sixteen, floating point is Float.
+fn raster_of(image: DynamicImage) -> (Raster, Depth) {
+    let depth = match image {
+        DynamicImage::ImageLuma16(_)
+        | DynamicImage::ImageLumaA16(_)
+        | DynamicImage::ImageRgb16(_)
+        | DynamicImage::ImageRgba16(_) => Depth::Sixteen,
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => Depth::Float,
+        _ => Depth::Eight,
+    };
+    let raster = match depth {
+        Depth::Eight => Raster::Eight(image.to_rgba8()),
+        _ => Raster::Deep(image.into_rgba32f()),
+    };
+    (raster, depth)
+}
+
+/// PNG of a layer: 8 bits, or 16 when it is deep.
+fn raster_png(raster: &Raster) -> Result<Vec<u8>> {
+    match raster {
+        Raster::Eight(image) => png(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        ),
+        Raster::Deep(image) => png(
+            &samples16(image.as_raw()),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba16,
         ),
     }
+}
+
+/// Deep pixels flattened on white, opaque.
+fn flatten_deep(image: &DeepImage) -> DeepImage {
+    let mut flat = image.clone();
+    for pixel in flat.pixels_mut() {
+        let a = pixel[3].clamp(0.0, 1.0);
+        for c in 0..3 {
+            pixel[c] = pixel[c] * a + 1.0 - a;
+        }
+        pixel[3] = 1.0;
+    }
+    flat
 }
 
 /// A flat image encoded as `format` in RGB, scaled by `options.scale`.
@@ -526,7 +687,7 @@ fn encode_cmyk(
     Ok(out.into_inner())
 }
 
-fn scaled(image: &RgbaImage, scale: f32) -> Result<Cow<'_, RgbaImage>> {
+fn scaled<S: Sample>(image: &Image<S>, scale: f32) -> Result<Cow<'_, Image<S>>> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::Format("scale must be above zero".into()));
     }
@@ -537,9 +698,12 @@ fn scaled(image: &RgbaImage, scale: f32) -> Result<Cow<'_, RgbaImage>> {
     let (width, height) = (size(image.width()), size(image.height()));
     check_size(width, height)?;
     let filter = image::imageops::FilterType::Lanczos3;
-    Ok(Cow::Owned(image::imageops::resize(
-        image, width, height, filter,
-    )))
+    Ok(Cow::Owned(if S::EIGHT {
+        image::imageops::resize(image, width, height, filter)
+    } else {
+        // The image crate's resize clips floating point to 0..=1.
+        transform::resize(image, width, height, Resample::Lanczos)
+    }))
 }
 
 fn flatten_on_white(image: &RgbaImage) -> image::RgbImage {
@@ -562,6 +726,36 @@ fn open_heic(bytes: &[u8]) -> Result<Document> {
     let decoded = heic_decoder::decode(bytes).map_err(failed)?;
     let gray = decoded.chroma_format_idc == 0;
     let icc = decoded.metadata.icc_profile.clone();
+    let mut doc = if decoded.bit_depth_luma > 8 || decoded.bit_depth_chroma > 8 {
+        let rgba = decoded.to_rgba16().map_err(failed)?;
+        let (width, height) = (rgba.width as u32, rgba.height as u32);
+        check_size(width, height)?;
+        let raw = rgba.data.iter().map(|&v| v as f32 / 65535.0).collect();
+        let mut image = DeepImage::from_raw(width, height, raw)
+            .ok_or_else(|| Error::Format("HEIC: the picture is cut short".into()))?;
+        if rgba.premultiplied {
+            for p in image.pixels_mut() {
+                if p[3] > 0.0 && p[3] < 1.0 {
+                    for c in 0..3 {
+                        p[c] = (p[c] / p[3]).min(1.0);
+                    }
+                }
+            }
+        }
+        Document::from_raster(Raster::Deep(image), Depth::Sixteen)
+    } else {
+        Document::from_image(heic_rgba8(&decoded)?)
+    };
+    doc.profile = icc.filter(|icc| crate::color::Profile::from_icc(icc).is_ok_and(|p| p.is_rgb()));
+    if gray {
+        doc.mode = crate::ColorMode::Grayscale;
+    }
+    Ok(doc)
+}
+
+/// An 8-bit HEIC picture, straight alpha.
+fn heic_rgba8(decoded: &heic_decoder::DecodedImage) -> Result<RgbaImage> {
+    let failed = |err: heic_decoder::HeifError| Error::Format(format!("HEIC: {err}"));
     let rgba = decoded.to_rgba8().map_err(failed)?;
     let (width, height) = (rgba.width as u32, rgba.height as u32);
     check_size(width, height)?;
@@ -577,12 +771,7 @@ fn open_heic(bytes: &[u8]) -> Result<Document> {
             }
         }
     }
-    let mut doc = Document::from_image(image);
-    doc.profile = icc.filter(|icc| crate::color::Profile::from_icc(icc).is_ok_and(|p| p.is_rgb()));
-    if gray {
-        doc.mode = crate::ColorMode::Grayscale;
-    }
-    Ok(doc)
+    Ok(image)
 }
 
 /// The format of a file from its first bytes.
@@ -639,7 +828,8 @@ fn check_size(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a layered file whose layers would not fit in memory.
+/// Refuse a layered file whose layers would not fit in memory (deep layers count four
+/// times: they hold 16 bytes a pixel).
 fn check_layers(count: usize, width: u32, height: u32) -> Result<()> {
     if count as u64 * width as u64 * height as u64 * 4 > MAX_LAYER_BYTES {
         return Err(Error::Format(format!(
@@ -909,6 +1099,93 @@ mod tests {
             open_bytes(&heic, None).is_err(),
             "a cut HEIC header is an error, not a panic"
         );
+    }
+
+    /// Deep pixels with every value of a row different, some bright when `depth` is Float.
+    fn deep_doc(depth: Depth) -> Document {
+        let bright = if depth == Depth::Float { 2.5 } else { 0.75 };
+        let image = DeepImage::from_fn(300, 2, |x, y| {
+            Rgba([
+                x as f32 / 299.0,
+                0.3,
+                bright,
+                if y == 0 { 1.0 } else { 0.5 },
+            ])
+        });
+        Document::from_raster(Raster::Deep(image), depth)
+    }
+
+    fn reopened(doc: &Document, format: Format) -> Document {
+        let bytes = encode(doc, format, &SaveOptions::default()).unwrap();
+        open_bytes(&bytes, Some(format)).unwrap()
+    }
+
+    #[test]
+    fn sixteen_bits_round_trip() {
+        let doc = deep_doc(Depth::Sixteen);
+        for format in [
+            Format::Png,
+            Format::Tiff,
+            Format::Psd,
+            Format::Native,
+            Format::OpenRaster,
+        ] {
+            let back = reopened(&doc, format);
+            assert_eq!(back.depth, Depth::Sixteen, "{format:?}");
+            assert_eq!(back.layers[0].content, doc.layers[0].content, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn floating_point_round_trips_with_bright_values() {
+        let doc = deep_doc(Depth::Float);
+        for format in [Format::Exr, Format::Tiff, Format::Psd, Format::Native] {
+            let back = reopened(&doc, format);
+            assert_eq!(back.depth, Depth::Float, "{format:?}");
+            assert_eq!(back.layers[0].content, doc.layers[0].content, "{format:?}");
+        }
+        // HDR has no alpha and rounds its values, but keeps light above 1.
+        let back = reopened(&doc, Format::Hdr);
+        assert_eq!(back.depth, Depth::Float);
+        let blue = back.composite_raster().to_deep().get_pixel(10, 0)[2];
+        assert!((blue - 2.5).abs() < 0.05, "{blue}");
+        // FITS keeps floats within 0..=1 as they are.
+        let mut dim = doc.clone();
+        dim.set_depth(Depth::Sixteen);
+        dim.set_depth(Depth::Float);
+        let back = reopened(&dim, Format::Fits);
+        assert_eq!(back.depth, Depth::Float);
+        let (want, got) = (
+            dim.composite_raster().to_deep(),
+            back.composite_raster().to_deep(),
+        );
+        assert!((want.get_pixel(150, 0)[0] - got.get_pixel(150, 0)[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eight_bit_formats_save_the_eight_bit_view() {
+        let doc = deep_doc(Depth::Sixteen);
+        for format in [Format::Jpeg, Format::WebP, Format::Bmp, Format::Gif] {
+            let back = reopened(&doc, format);
+            assert_eq!((back.depth, back.width), (Depth::Eight, 300), "{format:?}");
+        }
+        assert!(!Format::Jpeg.keeps_depth() && Format::Png.keeps_depth());
+    }
+
+    #[test]
+    fn truncated_deep_files_do_not_panic() {
+        for (depth, format) in [
+            (Depth::Sixteen, Format::Psd),
+            (Depth::Float, Format::Psd),
+            (Depth::Float, Format::Native),
+            (Depth::Sixteen, Format::Png),
+            (Depth::Float, Format::Exr),
+        ] {
+            let bytes = encode(&deep_doc(depth), format, &SaveOptions::default()).unwrap();
+            for len in (0..bytes.len()).step_by(97) {
+                let _ = open_bytes(&bytes[..len], Some(format));
+            }
+        }
     }
 
     #[test]

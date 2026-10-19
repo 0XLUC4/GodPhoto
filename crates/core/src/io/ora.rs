@@ -1,6 +1,7 @@
 //! OpenRaster: a zip with `mimetype`, `stack.xml`, one PNG per layer, `mergedimage.png`
 //! and a thumbnail. Groups are nested `<stack>`s; layers without pixels of their own
-//! (type, shapes, fills, smart objects) are saved drawn.
+//! (type, shapes, fills, smart objects) are saved drawn. Layers of deep documents are
+//! 16-bit PNG; a file with 16-bit layers opens as a 16-bit document.
 
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -9,8 +10,13 @@ use image::ExtendedColorType;
 use zip::{ZipArchive, ZipWriter};
 
 use super::xml::{Tag, tags};
-use super::{Zip, check_layers, check_size, decode, png, unit, zip_add, zip_read};
-use crate::{Blend, Content, Document, Error, Group, Layer, Result, RgbaImage, apply_mask};
+use super::{
+    Zip, check_layers, check_size, decode, png, raster_of, raster_png, unit, zip_add, zip_read,
+};
+use crate::{
+    Blend, Content, Depth, Document, Error, Group, Image, Layer, Raster, Result, RgbaImage,
+    apply_mask, with_raster,
+};
 
 /// `composite-op` values and the blend each stands for.
 const OPS: [(&str, Blend); 17] = [
@@ -69,14 +75,14 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
             }
             _ => {}
         }
-        let Some(mut pixels) = layer.render(width, height) else {
+        let Some(mut pixels) = layer.render(width, height, doc.depth) else {
             continue; // adjustments have no pixels to store
         };
         if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
-            apply_mask(&mut pixels, mask);
+            with_raster!(&mut pixels, image => apply_mask(image, mask));
         }
         let src = format!("data/layer-{index}.png");
-        zip_add(&mut zip, &src, &rgba_png(&pixels)?, false)?;
+        zip_add(&mut zip, &src, &raster_png(&pixels)?, false)?;
         let _ = writeln!(
             stack,
             r#"  <layer name="{}" src="{src}" x="0" y="0" opacity="{}" visibility="{}" composite-op="{}"/>"#,
@@ -94,8 +100,9 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<image version=\"0.0.3\" w=\"{width}\" h=\"{height}\" xres=\"{dpi}\" yres=\"{dpi}\">\n <stack>\n{stack} </stack>\n</image>\n"
     );
     zip_add(&mut zip, "stack.xml", xml.as_bytes(), true)?;
-    let merged = doc.composite();
-    zip_add(&mut zip, "mergedimage.png", &rgba_png(&merged)?, false)?;
+    let merged = doc.composite_raster();
+    zip_add(&mut zip, "mergedimage.png", &raster_png(&merged)?, false)?;
+    let merged = merged.into_rgba8();
     let thumbnail = fit_256(&merged);
     zip_add(
         &mut zip,
@@ -170,6 +177,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
 
     // Top first while reading. `depth` counts the open stacks, the root one included.
     let mut layers = Vec::new();
+    let mut bits = Depth::Eight;
     let mut depth = 0;
     for tag in &tags {
         match (tag.name, tag.closing) {
@@ -201,11 +209,17 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
             }
             ("layer", false) => {
                 let Some(src) = tag.attr("src") else { continue };
-                let image = decode(&zip_read(&mut archive, src)?, None)?.to_rgba8();
+                let (image, own) = raster_of(decode(&zip_read(&mut archive, src)?, None)?);
+                if own != Depth::Eight {
+                    bits = Depth::Sixteen;
+                }
                 let x = number(tag, "x").unwrap_or(0.0).round() as i64;
                 let y = number(tag, "y").unwrap_or(0.0).round() as i64;
-                let mut pixels = RgbaImage::new(width, height);
-                image::imageops::replace(&mut pixels, &image, x, y);
+                let pixels = with_raster!(image, image => {
+                    let mut pixels = Image::new(width, height);
+                    image::imageops::replace(&mut pixels, &image, x, y);
+                    Raster::from_image(pixels)
+                });
                 let mut layer = Layer::pixels(tag.attr("name").unwrap_or("Layer"), pixels);
                 layer.visible = visible(tag);
                 layer.opacity = opacity(tag);
@@ -222,15 +236,16 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
     layers.reverse();
     if !layers.iter().any(Layer::is_pixels) {
         layers.clear();
-        let merged = decode(&zip_read(&mut archive, "mergedimage.png")?, None)?.to_rgba8();
+        let (merged, own) = raster_of(decode(&zip_read(&mut archive, "mergedimage.png")?, None)?);
         if merged.dimensions() != (width, height) {
             return Err(Error::Format(
                 "mergedimage.png does not match the canvas size".into(),
             ));
         }
+        bits = own;
         layers.push(Layer::pixels("Background", merged));
     }
-    Ok(Document {
+    let mut doc = Document {
         mode: Default::default(),
         profile: None,
         slices: Vec::new(),
@@ -240,7 +255,11 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         dpi,
         guides: Vec::new(),
         channels: Vec::new(),
-    })
+        depth: Depth::Eight,
+    };
+    // Every layer at the deepest one's depth.
+    doc.set_depth(bits);
+    Ok(doc)
 }
 
 fn visible(tag: &Tag) -> bool {
@@ -294,7 +313,11 @@ mod tests {
             assert_eq!(a.visible, b.visible);
             assert_eq!(a.blend, b.blend);
             assert!((a.opacity - b.opacity).abs() < 1e-6);
-            let (Content::Pixels(p), Content::Pixels(q)) = (&a.content, &b.content) else {
+            let (
+                Content::Pixels(crate::Raster::Eight(p)),
+                Content::Pixels(crate::Raster::Eight(q)),
+            ) = (&a.content, &b.content)
+            else {
                 panic!()
             };
             assert_eq!(p, q);
@@ -318,7 +341,7 @@ mod tests {
         let layer = &doc.layers[1];
         assert!(layer.visible);
         assert!((layer.opacity - 0.5).abs() < 1e-6);
-        let Content::Pixels(pixels) = &layer.content else {
+        let Content::Pixels(crate::Raster::Eight(pixels)) = &layer.content else {
             panic!()
         };
         assert_eq!(pixels.get_pixel(1, 1), &Rgba([1, 2, 3, 255]));

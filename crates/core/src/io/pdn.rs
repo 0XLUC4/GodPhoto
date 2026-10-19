@@ -790,7 +790,7 @@ mod tests {
         assert!(!layer.visible);
         assert!((layer.opacity - 0.2).abs() < 1e-6);
         assert_eq!(layer.blend, Blend::Screen);
-        let Content::Pixels(image) = &layer.content else {
+        let Content::Pixels(crate::Raster::Eight(image)) = &layer.content else {
             panic!()
         };
         // BGRA 0,10,20,30 becomes RGBA 20,10,0,30.
@@ -804,7 +804,7 @@ mod tests {
         let end = bytes.len();
         bytes.truncate(end - 10); // the last pixel chunk is cut short
         let doc = read(&bytes).unwrap();
-        let Content::Pixels(image) = &doc.layers[0].content else {
+        let Content::Pixels(crate::Raster::Eight(image)) = &doc.layers[0].content else {
             panic!()
         };
         assert_eq!(image.dimensions(), (3, 2));

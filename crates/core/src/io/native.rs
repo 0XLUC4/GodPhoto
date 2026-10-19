@@ -1,6 +1,7 @@
-//! The native `.gphoto` file: a zip of `document.json`, one PNG per layer, mask and channel,
-//! `profile.icc` when the document has a colour profile, one nested `.gphoto` per smart
-//! object, and `composite.png` for quick previews.
+//! The native `.gphoto` file: a zip of `document.json`, one PNG per layer, mask and channel
+//! (layers of 16-bit documents as 16-bit PNG, of 32-bit documents as raw little-endian
+//! floats), `profile.icc` when the document has a colour profile, one nested `.gphoto` per
+//! smart object, and `composite.png` for quick previews.
 
 use std::io::Cursor;
 
@@ -9,16 +10,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zip::{ZipArchive, ZipWriter};
 
-use super::{Zip, check_layers, check_size, decode, png, unit, zip_add, zip_read};
+use super::{
+    Zip, check_layers, check_size, decode, png, raster_of, raster_png, unit, zip_add, zip_read,
+};
 use crate::smart::Smart;
 use crate::{
-    Blend, ColorMode, Content, Document, Error, GrayImage, Layer, Result, RgbaImage, Slice,
+    Blend, ColorMode, Content, DeepImage, Depth, Document, Error, GrayImage, Layer, Raster, Result,
+    RgbaImage, Slice,
 };
 
 const FORMAT: &str = "godphoto";
 /// 2 added shapes, patterns, groups, smart objects, colour mode, profile, slices,
-/// layer labels and links. Version 1 files still open.
-const VERSION: u32 = 2;
+/// layer labels and links; 3 added the depth and float layers. Older files still open.
+const VERSION: u32 = 3;
 /// Smart objects nested deeper than this are refused (a file holding itself, a zip bomb).
 const MAX_DEPTH: usize = 8;
 
@@ -41,6 +45,8 @@ struct DocumentFile {
     profile: Option<String>,
     #[serde(default)]
     slices: Vec<Slice>,
+    #[serde(default)]
+    depth: Depth,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,12 +74,22 @@ struct LayerFile {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ContentFile {
+    /// An 8 or 16-bit PNG entry.
     Pixels(String),
+    /// A raw entry of little-endian `f32` RGBA, `width` × `height`.
+    Float {
+        name: String,
+        width: u32,
+        height: u32,
+    },
     Adjustment(Value),
     Text(Value),
     Fill([u8; 4]),
     Gradient(Value),
-    Pattern { pattern: Value, scale: f32 },
+    Pattern {
+        pattern: Value,
+        scale: f32,
+    },
     Shape(Value),
     Smart(SmartFile),
     Group(Value),
@@ -101,9 +117,23 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
     let mut layers = Vec::with_capacity(doc.layers.len());
     for (index, layer) in doc.layers.iter().enumerate() {
         let content = match &layer.content {
-            Content::Pixels(image) => {
+            Content::Pixels(Raster::Deep(image)) if doc.depth == Depth::Float => {
+                let name = format!("layer-{index}.f32");
+                let bytes: Vec<u8> = image
+                    .as_raw()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                zip_add(&mut zip, &name, &bytes, true)?;
+                ContentFile::Float {
+                    name,
+                    width: image.width(),
+                    height: image.height(),
+                }
+            }
+            Content::Pixels(raster) => {
                 let name = format!("layer-{index}.png");
-                add_rgba(&mut zip, &name, image)?;
+                zip_add(&mut zip, &name, &raster_png(raster)?, false)?;
                 ContentFile::Pixels(name)
             }
             Content::Adjustment(adjustment) => {
@@ -191,6 +221,7 @@ pub(super) fn write(doc: &Document) -> Result<Vec<u8>> {
         mode: doc.mode,
         profile,
         slices: doc.slices.clone(),
+        depth: doc.depth,
     };
     zip_add(
         &mut zip,
@@ -241,7 +272,12 @@ fn read_nested(bytes: &[u8], depth: usize) -> Result<Document> {
     }
     let (width, height) = (file.width, file.height);
     check_size(width, height)?;
-    check_layers(file.layers.len() + file.channels.len(), width, height)?;
+    let deep = if file.depth.deep() { 4 } else { 1 };
+    check_layers(
+        file.layers.len() * deep + file.channels.len(),
+        width,
+        height,
+    )?;
     let profile = match &file.profile {
         Some(name) => Some(zip_read(&mut archive, name)?),
         None => None,
@@ -250,11 +286,17 @@ fn read_nested(bytes: &[u8], depth: usize) -> Result<Document> {
         archive,
         width,
         height,
+        depth: file.depth,
     };
     let mut layers = Vec::with_capacity(file.layers.len());
     for entry in file.layers {
         let content = match entry.content {
-            ContentFile::Pixels(name) => Content::Pixels(archive.rgba(&name)?),
+            ContentFile::Pixels(name) => Content::Pixels(archive.raster(&name)?),
+            ContentFile::Float {
+                name,
+                width,
+                height,
+            } => Content::Pixels(archive.float(&name, width, height)?),
             ContentFile::Adjustment(value) => Content::Adjustment(serde_json::from_value(value)?),
             ContentFile::Text(value) => Content::Text(serde_json::from_value(value)?),
             ContentFile::Fill(color) => Content::Fill(color),
@@ -311,6 +353,7 @@ fn read_nested(bytes: &[u8], depth: usize) -> Result<Document> {
         mode: file.mode,
         profile,
         slices: file.slices,
+        depth: file.depth,
     })
 }
 
@@ -319,17 +362,43 @@ struct Images<'a> {
     archive: ZipArchive<Cursor<&'a [u8]>>,
     width: u32,
     height: u32,
+    /// Of the document: layers are converted to it.
+    depth: Depth,
 }
 
 impl Images<'_> {
-    fn rgba(&mut self, name: &str) -> Result<RgbaImage> {
+    /// A PNG layer at the document's depth.
+    fn raster(&mut self, name: &str) -> Result<Raster> {
         let image = decode(
             &zip_read(&mut self.archive, name)?,
             Some(image::ImageFormat::Png),
-        )?
-        .to_rgba8();
-        self.fits(name, image.dimensions())?;
-        Ok(image)
+        )?;
+        self.fits(name, (image.width(), image.height()))?;
+        let (raster, depth) = raster_of(image);
+        Ok(if depth == self.depth {
+            raster
+        } else {
+            raster.converted(self.depth)
+        })
+    }
+
+    /// A raw float layer at the document's depth.
+    fn float(&mut self, name: &str, width: u32, height: u32) -> Result<Raster> {
+        self.fits(name, (width, height))?;
+        let bytes = zip_read(&mut self.archive, name)?;
+        let raw = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            // Not-a-number and negative values would upset blending.
+            .map(|v| if v.is_nan() { 0.0 } else { v.max(0.0) })
+            .collect();
+        let image = DeepImage::from_raw(width, height, raw)
+            .filter(|_| bytes.len() == width as usize * height as usize * 16)
+            .ok_or_else(|| Error::Format(format!("{name} is cut short")))?;
+        Ok(match self.depth {
+            Depth::Float => Raster::Deep(image),
+            depth => Raster::Deep(image).converted(depth),
+        })
     }
 
     fn gray(&mut self, name: &str) -> Result<GrayImage> {

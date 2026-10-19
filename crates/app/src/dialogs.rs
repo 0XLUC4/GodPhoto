@@ -8,7 +8,8 @@ use godphoto_core::io::{self, Format, SaveOptions};
 use godphoto_core::style::{self, Pattern, StrokePosition};
 use godphoto_core::transform::{Anchor, Resample};
 use godphoto_core::{
-    Adjustment, Background, Content, Effects, Filter, Layer, RgbaImage, adjust, select,
+    Adjustment, Background, Content, Effects, Filter, Image, Layer, Raster, Sample, adjust, select,
+    with_raster,
 };
 
 use crate::app::{Cmd, GodApp, Modify};
@@ -49,7 +50,7 @@ impl Effect {
         }
     }
 
-    fn apply(&self, image: &mut RgbaImage) {
+    fn apply<S: Sample>(&self, image: &mut Image<S>) {
         match self {
             Self::Filter(filter) => *image = filter.apply(image),
             Self::Adjust(adjustment) => adjustment.apply(image),
@@ -142,7 +143,7 @@ impl Effect {
 pub struct Preview {
     layer: usize,
     original: Layer,
-    job: Option<Receiver<RgbaImage>>,
+    job: Option<Receiver<Raster>>,
     /// The settings changed since the last preview was started.
     dirty: bool,
 }
@@ -453,21 +454,22 @@ impl GodApp {
                 preview.dirty = false;
                 let tab = &self.tabs[self.active];
                 let (width, height) = tab.size();
+                let depth = tab.doc.depth;
                 let original = preview
                     .original
-                    .render(width, height)
-                    .unwrap_or_else(|| RgbaImage::new(width, height));
+                    .render(width, height, depth)
+                    .unwrap_or_else(|| Raster::new(width, height, depth));
                 let selection = tab.selection.clone();
                 let effect = effect.clone();
                 let (send, receive) = channel();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     let mut changed = original.clone();
-                    effect.apply(&mut changed);
+                    with_raster!(&mut changed, image => effect.apply(image));
                     let result = match &selection {
                         Some(mask) => {
                             let mut out = original;
-                            godphoto_core::mix(&mut out, &changed, 1.0, Some(mask), None);
+                            godphoto_core::mix_raster(&mut out, &changed, 1.0, Some(mask), None);
                             out
                         }
                         None => changed,
@@ -498,12 +500,15 @@ impl GodApp {
             }
             if job.is_none() && *stale {
                 *stale = false;
-                let image = self.tabs[self.active].composite.clone();
+                // The flattened document, at its depth, mode and profile, as export writes it.
+                let tab = &self.tabs[self.active];
+                let mut flat = tab.doc.clone_empty();
+                flat.layers = vec![Layer::pixels("", tab.composite_raster())];
                 let (format, options) = (*format, *options);
                 let (send, receive) = channel();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    let size = io::encode_image(&image, format, &options)
+                    let size = io::encode(&flat, format, &options)
                         .map(|bytes| bytes.len())
                         .map_err(|err| err.to_string());
                     let _ = send.send(size);
@@ -677,6 +682,10 @@ impl GodApp {
                     (w as f32 * options.scale).round().max(1.0),
                     (h as f32 * options.scale).round().max(1.0)
                 ));
+                if self.tabs[self.active].doc.depth.deep() && !format.keeps_depth() {
+                    let note = format!("{} keeps only 8 bits per channel.", format.label());
+                    ui.label(RichText::new(note).color(ui.visuals().warn_fg_color));
+                }
                 match estimate {
                     Some(Ok(bytes)) => ui.label(format!("About {}", human_size(*bytes))),
                     Some(Err(err)) => {

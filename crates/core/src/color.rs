@@ -1015,13 +1015,17 @@ pub fn set_mode(doc: &mut Document, mode: ColorMode, options: &ModeOptions) {
     );
     let profile = Profile::of(doc.profile.as_deref());
     let cmyk = options.cmyk.clone().unwrap_or_else(Profile::generic_cmyk);
-    let (width, height) = (doc.width, doc.height);
+    let (width, height, depth) = (doc.width, doc.height, doc.depth);
     for layer in &mut doc.layers {
         if needs_pixels && !layer.is_pixels() && !matches!(layer.content, Content::Fill(_)) {
-            layer.rasterize(width, height);
+            layer.rasterize(width, height, depth);
         }
         match &mut layer.content {
-            Content::Pixels(image) => mode_pixels(image, mode, options, &profile, &cmyk),
+            Content::Pixels(raster) => {
+                crate::with_raster!(raster, image => {
+                    mode_pixels(image, mode, options, &profile, &cmyk)
+                })
+            }
             Content::Fill(color) if mode == ColorMode::Grayscale => {
                 let mut one = RgbaImage::from_pixel(1, 1, image::Rgba(*color));
                 adjust::desaturate(&mut one);
@@ -1099,7 +1103,9 @@ pub fn convert_profile(doc: &mut Document, to: &Profile, intent: Intent, bpc: bo
     };
     for layer in &mut doc.layers {
         match &mut layer.content {
-            Content::Pixels(image) => convert(image, &from, to, intent, bpc),
+            Content::Pixels(raster) => {
+                crate::with_raster!(raster, image => convert(image, &from, to, intent, bpc))
+            }
             Content::Fill(fill) => color(fill),
             Content::Text(text) => color(&mut text.color),
             _ => {}
@@ -1297,7 +1303,7 @@ mod tests {
             .push(Layer::new("Fill", Content::Fill([255, 0, 0, 255])));
         set_mode(&mut doc, ColorMode::Grayscale, &ModeOptions::default());
         assert_eq!(doc.mode, ColorMode::Grayscale);
-        let Content::Pixels(image) = &doc.layers[1].content else {
+        let Content::Pixels(crate::Raster::Eight(image)) = &doc.layers[1].content else {
             panic!("pixels")
         };
         assert!(image.pixels().all(|p| p[0] == p[1] && p[1] == p[2]));

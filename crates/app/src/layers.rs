@@ -4,7 +4,7 @@
 use std::ops::RangeInclusive;
 
 use godphoto_core::smart::{Smart, SmartFilter};
-use godphoto_core::{Content, Filter, Layer, io, transform};
+use godphoto_core::{Content, Filter, Layer, io, map_raster, transform, with_raster};
 
 use crate::app::{Arrange, GodApp, gray_to_rgba, rgba_to_gray};
 use crate::dialogs::Dialog;
@@ -449,7 +449,10 @@ impl GodApp {
             });
             return;
         }
-        self.on_pixels(&name, |image, _| *image = filter.apply(image));
+        self.on_pixels(
+            &name,
+            |raster, _| with_raster!(raster, image => *image = filter.apply(image)),
+        );
     }
 
     pub fn smart_filter(&mut self, layer: usize, number: usize, action: SmartAction) {
@@ -855,7 +858,9 @@ impl GodApp {
 pub fn shift_layer(layer: &mut Layer, dx: i32, dy: i32) {
     let (fx, fy) = (dx as f32, dy as f32);
     match &mut layer.content {
-        Content::Pixels(image) => *image = transform::shift(image, dx, dy),
+        Content::Pixels(raster) => {
+            *raster = map_raster!(&*raster, image => transform::shift(image, dx, dy))
+        }
         Content::Text(text) => {
             text.x += fx;
             text.y += fy;

@@ -17,7 +17,8 @@ pub trait Sample:
         + Send
         + Sync
         + std::fmt::Debug
-        + PartialEq;
+        + PartialEq
+        + 'static;
     /// Full intensity: 255 for `u8`, 1.0 for `f32`.
     const MAX: Self;
     /// Whether this is the 8-bit sample (fast paths with 256-entry tables).
@@ -74,15 +75,20 @@ pub type DeepImage = Image<f32>;
 /// Bits per channel of a document.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Depth {
+    /// 8 bits per channel.
     #[default]
     Eight,
+    /// 16 bits per channel, kept as floating point and rounded to 16 bits when saved.
     Sixteen,
+    /// 32-bit floating point, with light brighter than white.
     Float,
 }
 
 impl Depth {
+    /// Every depth, shallowest first.
     pub const ALL: [Depth; 3] = [Depth::Eight, Depth::Sixteen, Depth::Float];
 
+    /// Name shown in menus.
     pub fn name(self) -> &'static str {
         match self {
             Self::Eight => "8 Bits/Channel",
@@ -91,15 +97,27 @@ impl Depth {
         }
     }
 
+    /// More than 8 bits per channel.
     pub fn deep(self) -> bool {
         self != Self::Eight
+    }
+
+    /// Bits per channel: 8, 16 or 32.
+    pub fn bits(self) -> u8 {
+        match self {
+            Self::Eight => 8,
+            Self::Sixteen => 16,
+            Self::Float => 32,
+        }
     }
 }
 
 /// The pixels of a layer, at the depth of its document.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Raster {
+    /// 8 bits per channel.
     Eight(RgbaImage),
+    /// 16 or 32 bits per channel, as floating point.
     Deep(DeepImage),
 }
 
@@ -111,6 +129,18 @@ macro_rules! with_raster {
         match $raster {
             $crate::depth::Raster::Eight($image) => $body,
             $crate::depth::Raster::Deep($image) => $body,
+        }
+    };
+}
+
+/// Like [`with_raster!`], for a `body` that makes an image of the same depth: the result is
+/// a [`Raster`] again.
+#[macro_export]
+macro_rules! map_raster {
+    ($raster:expr, $image:ident => $body:expr) => {
+        match $raster {
+            $crate::depth::Raster::Eight($image) => $crate::depth::Raster::Eight($body),
+            $crate::depth::Raster::Deep($image) => $crate::depth::Raster::Deep($body),
         }
     };
 }
@@ -132,18 +162,53 @@ impl Raster {
         }
     }
 
+    /// Width and height.
     pub fn dimensions(&self) -> (u32, u32) {
         with_raster!(self, image => image.dimensions())
     }
 
+    /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.dimensions().0
     }
 
+    /// Height in pixels.
     pub fn height(&self) -> u32 {
         self.dimensions().1
     }
 
+    /// An image at any sample as a raster: `u8` stays 8 bits, `f32` is deep.
+    pub fn from_image<S: Sample>(image: Image<S>) -> Self {
+        if S::EIGHT {
+            Self::Eight(cast(image))
+        } else {
+            Self::Deep(cast(image))
+        }
+    }
+
+    /// The pixels as an image of sample `S` (converted only when the depth differs).
+    pub fn into_image<S: Sample>(self) -> Image<S> {
+        with_raster!(self, image => cast(image))
+    }
+
+    /// The pixels at 8 bits, without a copy when they already are.
+    pub fn into_rgba8(self) -> RgbaImage {
+        self.into_image()
+    }
+
+    /// Run an 8-bit-only `change` on the pixels; deep pixels take its 8-bit result.
+    pub fn through_eight(&mut self, change: impl FnOnce(&mut RgbaImage)) {
+        match self {
+            Self::Eight(image) => change(image),
+            Self::Deep(image) => {
+                let mut eight = to_rgba8(image);
+                change(&mut eight);
+                *image = to_deep(&eight);
+            }
+        }
+    }
+
+    /// Holds more than 8 bits per channel.
     pub fn is_deep(&self) -> bool {
         matches!(self, Self::Deep(_))
     }
@@ -156,6 +221,7 @@ impl Raster {
         }
     }
 
+    /// The pixels as floating point.
     pub fn to_deep(&self) -> DeepImage {
         match self {
             Self::Eight(image) => to_deep(image),
@@ -193,6 +259,30 @@ pub fn convert<A: Sample, B: Sample>(image: &Image<A>) -> Image<B> {
         .map(|v| B::from_unit(v.unit()))
         .collect();
     Image::<B>::from_raw(image.width(), image.height(), raw).expect("same size")
+}
+
+/// `image` as an image of sample `B`: moved as it is when `A` is `B`, converted otherwise.
+pub fn cast<A: Sample, B: Sample>(image: Image<A>) -> Image<B> {
+    let any: Box<dyn std::any::Any> = Box::new(image);
+    match any.downcast::<Image<B>>() {
+        Ok(same) => *same,
+        Err(any) => match any.downcast::<Image<A>>() {
+            Ok(image) => convert(&image),
+            Err(_) => unreachable!("the box holds an Image<A>"),
+        },
+    }
+}
+
+impl From<RgbaImage> for Raster {
+    fn from(image: RgbaImage) -> Self {
+        Self::Eight(image)
+    }
+}
+
+impl From<DeepImage> for Raster {
+    fn from(image: DeepImage) -> Self {
+        Self::Deep(image)
+    }
 }
 
 /// Values kept to what 16 bits can hold (0..=1 in steps of 1/65535).

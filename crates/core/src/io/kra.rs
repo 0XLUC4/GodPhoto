@@ -6,8 +6,8 @@ use std::io::Cursor;
 use zip::ZipArchive;
 
 use super::xml::{Tag, tags};
-use super::{check_layers, check_size, decode, unit, zip_read};
-use crate::{Blend, Content, Document, Error, Group, Layer, Result, RgbaImage};
+use super::{check_layers, check_size, decode, raster_of, unit, zip_read};
+use crate::{Blend, Content, Depth, Document, Error, Group, Layer, Result, RgbaImage};
 
 /// `compositeop` names and the blend each stands for.
 const BLENDS: [(&str, Blend); 28] = [
@@ -70,19 +70,22 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
         .unwrap_or(72.0);
     let root = image.attr("name").unwrap_or_default().to_owned();
     // One unreadable layer would leave a hole: the merged image shows the whole picture.
-    let layers = match layers(&tags, &mut archive, &root, width, height) {
-        Ok(layers) if !layers.is_empty() => layers,
+    // Deeper colour spaces than 8-bit RGBA open as their merged image, at its depth.
+    let (layers, depth) = match layers(&tags, &mut archive, &root, width, height) {
+        Ok(layers) if !layers.is_empty() => (layers, Depth::Eight),
         _ => {
-            let merged = decode(&zip_read(&mut archive, "mergedimage.png")?, None)?.to_rgba8();
+            let (merged, depth) =
+                raster_of(decode(&zip_read(&mut archive, "mergedimage.png")?, None)?);
             if merged.dimensions() != (width, height) {
                 return Err(Error::Format(
                     "mergedimage.png does not match the canvas size".into(),
                 ));
             }
-            vec![Layer::pixels("Background", merged)]
+            (vec![Layer::pixels("Background", merged)], depth)
         }
     };
     let mut doc = Document::from_image(RgbaImage::new(0, 0));
+    doc.depth = depth;
     doc.width = width;
     doc.height = height;
     doc.layers = layers;
@@ -363,12 +366,12 @@ mod tests {
         let top = &doc.layers[3];
         assert_eq!(top.blend, Blend::Multiply);
         assert!((top.opacity - 128.0 / 255.0).abs() < 1e-6);
-        let Content::Pixels(pixels) = &top.content else {
+        let Content::Pixels(crate::Raster::Eight(pixels)) = &top.content else {
             panic!()
         };
         assert_eq!(pixels.get_pixel(1, 1), &Rgba([255, 0, 0, 255]));
         assert_eq!(pixels.get_pixel(0, 0)[3], 0);
-        let Content::Pixels(inner) = &doc.layers[1].content else {
+        let Content::Pixels(crate::Raster::Eight(inner)) = &doc.layers[1].content else {
             panic!()
         };
         assert_eq!(inner.get_pixel(2, 1), &Rgba([0, 0, 255, 200]));
@@ -378,7 +381,7 @@ mod tests {
     fn kra_falls_back_to_the_merged_image() {
         let doc = read(&sample("CMYK")).unwrap();
         assert_eq!(doc.layers.len(), 1);
-        let Content::Pixels(pixels) = &doc.layers[0].content else {
+        let Content::Pixels(crate::Raster::Eight(pixels)) = &doc.layers[0].content else {
             panic!()
         };
         assert_eq!(pixels.get_pixel(3, 2), &Rgba([9, 9, 9, 255]));

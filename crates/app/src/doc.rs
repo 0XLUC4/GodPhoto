@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
-use godphoto_core::{Content, Document, GrayImage, Layer, RgbaImage, color, select, transform};
+use godphoto_core::{
+    Content, Depth, Document, GrayImage, Layer, Raster, RgbaImage, color, map_raster, select,
+    transform, with_raster,
+};
 
 /// Pixels the undo steps may hold, all together.
 const HISTORY_BUDGET: usize = 2_000_000_000;
@@ -19,6 +22,7 @@ pub struct Step {
     pub width: u32,
     pub height: u32,
     pub dpi: f32,
+    pub depth: Depth,
     pub guides: Vec<(bool, f32)>,
     pub channels: Vec<(String, GrayImage)>,
     pub active: usize,
@@ -78,7 +82,7 @@ pub struct DocTab {
     /// Marching ants, cached per selection.
     pub ants: Option<Arc<Vec<(egui::Pos2, egui::Pos2)>>>,
     /// While painting: the layers drawn once, so parts of them can be composited fast.
-    rendered: Option<Vec<Option<RgbaImage>>>,
+    rendered: Option<Vec<Option<Raster>>>,
     /// Layer left out of the composite (shown apart while it moves or transforms).
     pub hidden: Vec<usize>,
     pub notes: Vec<Note>,
@@ -157,7 +161,7 @@ impl DocTab {
     }
 
     /// Pixels of the active layer, when it has pixels and is not locked.
-    pub fn pixels_mut(&mut self) -> Option<&mut RgbaImage> {
+    pub fn pixels_mut(&mut self) -> Option<&mut Raster> {
         match self.doc.layers.get_mut(self.active) {
             Some(Layer {
                 content: Content::Pixels(image),
@@ -187,7 +191,10 @@ impl DocTab {
                 match same {
                     Some(kept) => kept.clone(),
                     None => {
-                        weight += one * 4;
+                        weight += match layer.content {
+                            Content::Pixels(Raster::Deep(_)) => one * 16,
+                            _ => one * 4,
+                        };
                         Arc::new(layer.clone())
                     }
                 }
@@ -210,6 +217,7 @@ impl DocTab {
             width: self.doc.width,
             height: self.doc.height,
             dpi: self.doc.dpi,
+            depth: self.doc.depth,
             guides: self.doc.guides.clone(),
             channels: self.doc.channels.clone(),
             active: self.active,
@@ -220,6 +228,15 @@ impl DocTab {
 
     /// Note a change named `name`: it becomes a step of the history.
     pub fn commit(&mut self, name: &str) {
+        // Pixels brought in at another depth (pasted, placed, made at 8 bits) join the document's.
+        let depth = self.doc.depth;
+        for layer in &mut self.doc.layers {
+            if let Content::Pixels(raster) = &mut layer.content
+                && raster.is_deep() != depth.deep()
+            {
+                *raster = raster.converted(depth);
+            }
+        }
         self.history.truncate(self.at + 1);
         let step = self.snapshot(name, self.history.last());
         self.history.push(step);
@@ -243,6 +260,7 @@ impl DocTab {
         self.doc.width = step.width;
         self.doc.height = step.height;
         self.doc.dpi = step.dpi;
+        self.doc.depth = step.depth;
         self.doc.guides = step.guides.clone();
         self.doc.channels = step.channels.clone();
         self.doc.layers = step.layers.iter().map(|layer| (**layer).clone()).collect();
@@ -276,7 +294,7 @@ impl DocTab {
         if self.doc.layers.is_empty() {
             self.doc.layers.push(Layer::pixels(
                 "Layer 1",
-                RgbaImage::new(self.doc.width, self.doc.height),
+                Raster::new(self.doc.width, self.doc.height, self.doc.depth),
             ));
         }
         self.active = self.active.min(self.doc.layers.len() - 1);
@@ -305,13 +323,14 @@ impl DocTab {
     /// again quickly while the stroke goes on.
     pub fn begin_live(&mut self) {
         let (width, height) = self.size();
+        let depth = self.doc.depth;
         let rendered = self
             .doc
             .layers
             .iter()
             .map(|layer| match layer.content {
                 Content::Pixels(_) | Content::Adjustment(_) => None,
-                _ => layer.render(width, height),
+                _ => layer.render(width, height, depth),
             })
             .collect();
         self.rendered = Some(rendered);
@@ -336,9 +355,10 @@ impl DocTab {
         part.width = w;
         part.height = h;
         for (index, layer) in self.doc.layers.iter().enumerate() {
+            let crop =
+                |raster: &Raster| map_raster!(raster, image => transform::crop(image, x, y, w, h));
             let content = match (&layer.content, &rendered[index]) {
-                (Content::Pixels(image), _) => Content::Pixels(transform::crop(image, x, y, w, h)),
-                (_, Some(image)) => Content::Pixels(transform::crop(image, x, y, w, h)),
+                (Content::Pixels(raster), _) | (_, Some(raster)) => Content::Pixels(crop(raster)),
                 (content, None) => content.clone(),
             };
             let mut piece = layer_settings(layer);
@@ -350,6 +370,7 @@ impl DocTab {
             piece.visible = layer.visible && !self.hidden.contains(&index);
             part.layers.push(piece);
         }
+        // Composited at the document's depth, shown at 8 bits.
         let piece = part.composite();
         image::imageops::replace(&mut self.composite, &piece, x as i64, y as i64);
         self.changed.push(area);
@@ -425,6 +446,14 @@ impl DocTab {
         self.texture.clone().expect("made above")
     }
 
+    /// The composite at the document's depth (the shown one when it is 8 bits).
+    pub fn composite_raster(&self) -> Raster {
+        match self.doc.depth {
+            Depth::Eight => Raster::Eight(self.composite.clone()),
+            _ => self.doc.composite_raster(),
+        }
+    }
+
     /// Proof colours or warn of the gamut on screen (`None`: as they are).
     pub fn set_view(&mut self, view: Option<ColorView>) {
         let key = |v: &Option<ColorView>| v.as_ref().map(|v| v.key);
@@ -464,7 +493,9 @@ impl DocTab {
         let (width, height) = self.size();
         let whole = (0, 0, width, height);
         match self.doc.layers.get(index).map(|layer| &layer.content) {
-            Some(Content::Pixels(image)) => transform::trim(image, true).unwrap_or(whole),
+            Some(Content::Pixels(raster)) => {
+                with_raster!(raster, image => transform::trim(image, true)).unwrap_or(whole)
+            }
             Some(Content::Text(text)) => {
                 let (x, y, w, h) = text.bounds();
                 (
