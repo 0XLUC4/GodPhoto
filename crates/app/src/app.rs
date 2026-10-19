@@ -1769,7 +1769,11 @@ impl GodApp {
         let (old_width, old_height) = tab.size();
         let depth = tab.doc.depth;
         for layer in &mut tab.doc.layers {
-            if matches!(layer.content, Content::Text(_) | Content::Gradient(_)) {
+            // Live layers kept in canvas coordinates turn to pixels to follow the map.
+            if matches!(
+                layer.content,
+                Content::Text(_) | Content::Gradient(_) | Content::Shape(_) | Content::Smart(_)
+            ) {
                 layer.rasterize(old_width, old_height, depth);
             }
             if let Content::Pixels(pixels) = &mut layer.content {
@@ -1913,11 +1917,25 @@ impl GodApp {
         let y = y.min(doc_height - 1);
         let width = width.clamp(1, doc_width - x);
         let height = height.clamp(1, doc_height - y);
-        // Type moves with the crop and stays live.
+        // Type, shapes and smart objects move with the crop and stay live.
+        let (fx, fy) = (x as f32, y as f32);
         for layer in &mut self.tab().doc.layers {
-            if let Content::Text(text) = &mut layer.content {
-                text.x -= x as f32;
-                text.y -= y as f32;
+            match &mut layer.content {
+                Content::Text(text) => {
+                    text.x -= fx;
+                    text.y -= fy;
+                }
+                Content::Shape(vector) => vector.transform(|(px, py)| (px - fx, py - fy)),
+                Content::Smart(smart) => {
+                    for corner in &mut smart.corners {
+                        *corner = (corner.0 - fx, corner.1 - fy);
+                    }
+                    if let Some(mask) = &mut smart.filter_mask {
+                        *mask = transform::crop_gray(mask, x, y, width, height);
+                    }
+                    smart.touch();
+                }
+                _ => {}
             }
         }
         self.map_canvas_keep_text(

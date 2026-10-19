@@ -96,23 +96,19 @@ impl GodApp {
     pub fn delete_layers(&mut self) {
         let picked = self.picked();
         let tab = self.tab();
-        let mut spans: Vec<RangeInclusive<usize>> =
-            picked.iter().map(|i| tab.doc.span(*i)).collect();
-        spans.sort_by_key(|span| std::cmp::Reverse(*span.start()));
-        let mut last_start = usize::MAX;
-        for span in spans {
-            // A span inside one already removed went with it.
-            if *span.end() >= last_start {
-                continue;
-            }
-            last_start = *span.start();
-            tab.doc.layers.drain(span);
-        }
-        if last_start == usize::MAX {
+        // Spans may nest (a group picked with its layers): remove their union.
+        let spans: Vec<RangeInclusive<usize>> = picked.iter().map(|i| tab.doc.span(*i)).collect();
+        let Some(lowest) = spans.iter().map(|span| *span.start()).min() else {
             return;
-        }
+        };
+        let mut index = 0;
+        tab.doc.layers.retain(|_| {
+            let keep = !spans.iter().any(|span| span.contains(&index));
+            index += 1;
+            keep
+        });
         tab.picked.clear();
-        tab.active = last_start.saturating_sub(1);
+        tab.active = lowest.saturating_sub(1);
         tab.commit("Delete Layer");
     }
 
@@ -302,8 +298,18 @@ impl GodApp {
             self.toasts.error("Pick an unlocked layer to move.");
             return;
         }
+        // Groups moved with their layers bring their masks along.
+        let doc = &self.tabs[self.active].doc;
+        let mut headers: Vec<usize> = self
+            .picked()
+            .into_iter()
+            .flat_map(|index| doc.span(index))
+            .filter(|index| matches!(doc.layers[*index].content, Content::Group(_)))
+            .collect();
+        headers.sort_unstable();
+        headers.dedup();
         let tab = self.tab();
-        for index in targets {
+        for index in targets.into_iter().chain(headers) {
             shift_layer(&mut tab.doc.layers[index], dx, dy);
         }
         tab.commit(step);
@@ -528,14 +534,14 @@ impl GodApp {
         let span = tab.doc.span(header);
         for index in span {
             let layer = &mut tab.doc.layers[index];
-            if let Content::Group(group) = &mut layer.content {
-                if let Some(board) = &mut group.artboard {
-                    board.x += dx;
-                    board.y += dy;
-                }
-            } else {
-                shift_layer(layer, dx, dy);
+            if let Content::Group(group) = &mut layer.content
+                && let Some(board) = &mut group.artboard
+            {
+                board.x += dx;
+                board.y += dy;
             }
+            // A group header only has its mask (a frame's picture area) to move.
+            shift_layer(layer, dx, dy);
         }
         tab.active = header;
         tab.commit("Move Artboard");

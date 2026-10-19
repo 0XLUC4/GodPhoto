@@ -639,7 +639,16 @@ impl GodApp {
                 }
                 d
             });
-            if dx != 0 || dy != 0 {
+            let selected = self.tabs[self.active].selection.is_some();
+            if (dx != 0 || dy != 0) && selected && self.canvas.moving.is_none() {
+                // With a selection the selected pixels move, as when dragged.
+                if self.start_move(ui, Pos2::ZERO, false).is_some()
+                    && let Some(moving) = &mut self.canvas.moving
+                {
+                    moving.offset = vec2(dx as f32, dy as f32);
+                    self.canvas_commit_transform();
+                }
+            } else if dx != 0 || dy != 0 {
                 self.shift_layer(dx, dy, "Nudge");
             }
         }
@@ -1903,6 +1912,7 @@ impl GodApp {
 
     /// Start moving the active layer (or its selected pixels).
     fn start_move(&mut self, ui: &mut Ui, at: Pos2, content_aware: bool) -> Option<Drag> {
+        let targets = self.targets();
         let tab = &mut self.tabs[self.active];
         let (width, height) = tab.size();
         let layer = tab.layer()?;
@@ -1968,11 +1978,10 @@ impl GodApp {
             tab.recomposite();
             image
         } else {
-            let mut image = layer.render_as::<u8>(width, height)?;
-            if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
-                godphoto_core::apply_mask(&mut image, mask);
-            }
-            image
+            // Every layer the move carries (linked, picked, in the group) shows moving.
+            let mut alone = tab.doc.clone_empty();
+            alone.layers = targets.iter().map(|i| tab.doc.layers[*i].clone()).collect();
+            alone.composite()
         };
         let (x, y, w, h) = transform::trim(&image, true).unwrap_or((0, 0, width, height));
         let piece = transform::crop(&image, x, y, w, h);
@@ -1982,7 +1991,7 @@ impl GodApp {
             TextureOptions::LINEAR,
         );
         if lift.is_none() {
-            tab.hidden = vec![tab.active];
+            tab.hidden = targets;
             tab.recomposite();
         }
         self.canvas.moving = Some(Moving {
