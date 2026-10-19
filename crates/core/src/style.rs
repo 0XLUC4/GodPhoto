@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::RgbaImage;
 use crate::blend::{self, Blend};
+use crate::depth::{Image, Sample};
 
 /// Drop or inner shadow.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -311,14 +312,16 @@ struct Part {
 }
 
 impl Paint {
-    fn at(&self, index: usize) -> [u8; 3] {
-        match self {
+    /// Colour at pixel `index`, as fractions.
+    fn at(&self, index: usize) -> [f32; 3] {
+        let rgb = match self {
             Self::Solid(color) => *color,
             Self::Image(image) => {
                 let raw = image.as_raw();
                 [raw[index * 4], raw[index * 4 + 1], raw[index * 4 + 2]]
             }
-        }
+        };
+        rgb.map(|v| v as f32 / 255.0)
     }
 }
 
@@ -341,21 +344,23 @@ impl Effects {
     /// From the layer's pixels (mask already applied): (under, over).
     /// `under` (drop shadow, outer glow, outer stroke) goes under the layer; `over` (inner
     /// effects, overlays, inner stroke) goes over it and is already cut to its alpha.
-    pub fn render(&self, layer: &RgbaImage) -> (Option<RgbaImage>, Option<RgbaImage>) {
+    /// Works at every depth; effect colours themselves are 8-bit.
+    #[allow(clippy::type_complexity)]
+    pub fn render<S: Sample>(&self, layer: &Image<S>) -> (Option<Image<S>>, Option<Image<S>>) {
         if !self.any() || layer.width() == 0 || layer.height() == 0 {
             return (None, None);
         }
         let alpha = Map::alpha(layer);
-        let (under, over) = self.parts(&alpha, layer);
+        let (under, over) = self.parts(&alpha);
         let under =
             (!under.is_empty()).then(|| compose_under(&under, layer.width(), layer.height()));
         let over = (!over.is_empty()).then(|| compose_over(layer, &alpha, &over));
-        let visible = |image: &RgbaImage| image.pixels().any(|pixel| pixel[3] > 0);
+        let visible = |image: &Image<S>| image.pixels().any(|pixel| pixel[3] > S::default());
         (under.filter(visible), over.filter(visible))
     }
 
     /// Effect parts, bottom first: (under, over).
-    fn parts(&self, alpha: &Map, layer: &RgbaImage) -> (Vec<Part>, Vec<Part>) {
+    fn parts(&self, alpha: &Map) -> (Vec<Part>, Vec<Part>) {
         let (mut under, mut over) = (Vec::new(), Vec::new());
         let inverse = alpha.map(|a| 1.0 - a);
         if let Some(shadow) = &self.drop_shadow {
@@ -387,7 +392,7 @@ impl Effects {
             let coverage = soften(&inverse, glow.spread, glow.size);
             over.push(part(glow.color, coverage, glow.opacity, glow.blend));
         }
-        let (width, height) = (layer.width(), layer.height());
+        let (width, height) = (alpha.width as u32, alpha.height as u32);
         if let Some(color) = self.color_overlay {
             let coverage = Map::filled(width, height, 1.0);
             over.push(part(
@@ -564,21 +569,23 @@ fn satin_part(satin: &Satin, alpha: &Map) -> Part {
 }
 
 /// Stack `parts` on transparency, each with its own mode.
-fn compose_under(parts: &[Part], width: u32, height: u32) -> RgbaImage {
-    let mut out = RgbaImage::new(width, height);
+fn compose_under<S: Sample>(parts: &[Part], width: u32, height: u32) -> Image<S> {
+    let mut out = Image::<S>::new(width, height);
     for part in parts {
         out.par_chunks_mut(4)
             .enumerate()
             .for_each(|(index, pixel)| {
                 let coverage = part.coverage.values[index];
                 if coverage > 0.0 {
-                    let mixed = blend::over(
-                        [pixel[0], pixel[1], pixel[2], pixel[3]],
+                    let mixed = blend::over_unit(
+                        [0, 1, 2, 3].map(|c| pixel[c].unit()),
                         part.paint.at(index),
                         coverage,
                         part.blend,
                     );
-                    pixel.copy_from_slice(&mixed);
+                    for (slot, value) in pixel.iter_mut().zip(mixed) {
+                        *slot = S::from_unit(value);
+                    }
                 }
             });
     }
@@ -587,8 +594,8 @@ fn compose_under(parts: &[Part], width: u32, height: u32) -> RgbaImage {
 
 /// Apply `parts` in turn over the layer's colours, then express the change as one image
 /// that, put Normal over the layer, gives the same result. Its alpha is cut to the layer's.
-fn compose_over(layer: &RgbaImage, alpha: &Map, parts: &[Part]) -> RgbaImage {
-    let mut out = RgbaImage::new(layer.width(), layer.height());
+fn compose_over<S: Sample>(layer: &Image<S>, alpha: &Map, parts: &[Part]) -> Image<S> {
+    let mut out = Image::<S>::new(layer.width(), layer.height());
     out.par_chunks_mut(4)
         .zip(layer.par_chunks(4))
         .enumerate()
@@ -597,7 +604,7 @@ fn compose_over(layer: &RgbaImage, alpha: &Map, parts: &[Part]) -> RgbaImage {
             if shape <= 0.0 {
                 return;
             }
-            let base = [base[0], base[1], base[2]].map(|v| v as f32 / 255.0);
+            let base = [base[0], base[1], base[2]].map(|v| v.unit());
             let mut color = base;
             let mut keep = 1.0;
             for part in parts {
@@ -605,8 +612,7 @@ fn compose_over(layer: &RgbaImage, alpha: &Map, parts: &[Part]) -> RgbaImage {
                 if coverage <= 0.0 {
                     continue;
                 }
-                let top = part.paint.at(index).map(|v| v as f32 / 255.0);
-                let mixed = part.blend.mix(color, top);
+                let mixed = part.blend.mix(color, part.paint.at(index));
                 color = [0, 1, 2].map(|i| color[i] + (mixed[i] - color[i]) * coverage);
                 keep *= 1.0 - coverage;
             }
@@ -615,16 +621,8 @@ fn compose_over(layer: &RgbaImage, alpha: &Map, parts: &[Part]) -> RgbaImage {
                 return;
             }
             // c * over + (1 - c) * base = color  =>  over = (color - (1 - c) * base) / c
-            let rgb = [0, 1, 2].map(|i| {
-                let value = (color[i] - keep * base[i]) / reach;
-                (value * 255.0).round().clamp(0.0, 255.0) as u8
-            });
-            pixel.copy_from_slice(&[
-                rgb[0],
-                rgb[1],
-                rgb[2],
-                (reach * shape * 255.0).round() as u8,
-            ]);
+            let rgb = [0, 1, 2].map(|i| S::from_unit((color[i] - keep * base[i]) / reach));
+            pixel.copy_from_slice(&[rgb[0], rgb[1], rgb[2], S::from_unit(reach * shape)]);
         });
     out
 }
@@ -638,13 +636,13 @@ impl Map {
         }
     }
 
-    fn alpha(image: &RgbaImage) -> Self {
+    fn alpha<S: Sample>(image: &Image<S>) -> Self {
         Self {
             width: image.width() as usize,
             height: image.height() as usize,
             values: image
                 .pixels()
-                .map(|pixel| pixel[3] as f32 / 255.0)
+                .map(|pixel| pixel[3].unit().min(1.0))
                 .collect(),
         }
     }
@@ -893,5 +891,26 @@ mod tests {
         let custom = Pattern::from_image(&tile);
         assert_eq!(custom.sample(3, 0, 1.0), [255, 0, 0, 255]);
         assert_eq!(custom.sample(-2, 0, 1.0), [0, 0, 0, 255]);
+    }
+    #[test]
+    fn deep_layers_render_like_eight_bit_ones() {
+        let layer = square(30, 8, 20);
+        let effects = Effects {
+            drop_shadow: Some(Shadow::default()),
+            stroke: Some(Stroke {
+                position: StrokePosition::Center,
+                ..Stroke::default()
+            }),
+            color_overlay: Some([0, 0, 255, 128]),
+            ..Effects::default()
+        };
+        let (under, over) = effects.render(&layer);
+        let (deep_under, deep_over) = effects.render(&crate::depth::to_deep(&layer));
+        for (eight, deep) in [(under, deep_under), (over, deep_over)] {
+            let (eight, deep) = (eight.expect("drawn"), deep.expect("drawn"));
+            for (a, b) in eight.pixels().zip(deep.pixels()) {
+                assert!((0..4).all(|c| (a[c] as f32 / 255.0 - b[c]).abs() <= 1.0 / 255.0));
+            }
+        }
     }
 }

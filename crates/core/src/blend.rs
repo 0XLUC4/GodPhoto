@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::RgbaImage;
+use crate::{Image, Sample};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Blend {
@@ -259,7 +259,7 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 }
 
 /// Put `top` over `bottom` with `mode` at `opacity` (0..=1). Both are straight RGBA, same size.
-pub fn composite(bottom: &mut RgbaImage, top: &RgbaImage, mode: Blend, opacity: f32) {
+pub fn composite<S: Sample>(bottom: &mut Image<S>, top: &Image<S>, mode: Blend, opacity: f32) {
     if opacity <= 0.0 {
         return;
     }
@@ -269,7 +269,7 @@ pub fn composite(bottom: &mut RgbaImage, top: &RgbaImage, mode: Blend, opacity: 
         .zip(top.par_chunks(4))
         .enumerate()
         .for_each(|(index, (b, t))| {
-            let mut alpha_s = t[3] as f32 / 255.0 * opacity;
+            let mut alpha_s = t[3].unit() * opacity;
             if alpha_s <= 0.0 {
                 return;
             }
@@ -281,9 +281,34 @@ pub fn composite(bottom: &mut RgbaImage, top: &RgbaImage, mode: Blend, opacity: 
                 }
                 alpha_s = 1.0;
             }
-            let out = over([b[0], b[1], b[2], b[3]], [t[0], t[1], t[2]], alpha_s, mode);
-            b.copy_from_slice(&out);
+            let unit = |v: &[S]| [v[0].unit(), v[1].unit(), v[2].unit(), v[3].unit()];
+            let (under, above) = (unit(b), unit(t));
+            let out = over_unit(under, [above[0], above[1], above[2]], alpha_s, mode);
+            for (slot, value) in b.iter_mut().zip(out) {
+                *slot = S::from_unit(value);
+            }
         });
+}
+
+/// One pixel of `top` (its colour at `alpha_s`) over `bottom`, channels as fractions
+/// (above 1 for very bright colours at deep depths).
+pub fn over_unit(bottom: [f32; 4], top: [f32; 3], alpha_s: f32, mode: Blend) -> [f32; 4] {
+    let alpha_b = bottom[3].clamp(0.0, 1.0);
+    let (cs, cb) = (top, [bottom[0], bottom[1], bottom[2]]);
+    let mixed = if alpha_b > 0.0 && mode != Blend::Normal {
+        // Blend modes are defined on 0..=1.
+        let blended = mode.mix(cb.map(|v| v.clamp(0.0, 1.0)), cs.map(|v| v.clamp(0.0, 1.0)));
+        [0, 1, 2].map(|i| (1.0 - alpha_b) * cs[i] + alpha_b * blended[i])
+    } else {
+        cs
+    };
+    let alpha_o = alpha_s + alpha_b * (1.0 - alpha_s);
+    if alpha_o <= 0.0 {
+        return [0.0; 4];
+    }
+    let color =
+        [0, 1, 2].map(|i| (alpha_s * mixed[i] + alpha_b * (1.0 - alpha_s) * cb[i]) / alpha_o);
+    [color[0], color[1], color[2], alpha_o]
 }
 
 /// One pixel of `top` (its colour at `alpha_s`) over `bottom`.

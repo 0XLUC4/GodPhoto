@@ -1527,12 +1527,12 @@ impl GodApp {
                 if tool == Tool::CloneStamp {
                     paint::Tool::CloneStamp {
                         offset,
-                        source: image,
+                        source: godphoto_core::Raster::Eight(image),
                     }
                 } else {
                     paint::Tool::HealingBrush {
                         offset,
-                        source: image,
+                        source: godphoto_core::Raster::Eight(image),
                     }
                 }
             }
@@ -1553,7 +1553,9 @@ impl GodApp {
                 let source = first
                     .and_then(|layer| layer.render(width, height))
                     .unwrap_or_else(|| tab.composite.clone());
-                paint::Tool::HistoryBrush { source }
+                paint::Tool::HistoryBrush {
+                    source: godphoto_core::Raster::Eight(source),
+                }
             }
             Tool::Blur => paint::Tool::Blur {
                 strength: self.options.strength / 100.0,

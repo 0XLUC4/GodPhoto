@@ -9,7 +9,10 @@ use std::ops::RangeInclusive;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{GrayImage, RgbaImage, luma};
+use image::Pixel;
+
+use crate::depth::{Image, Sample};
+use crate::{GrayImage, luma};
 
 /// A slider or toggle bound to a field of a filter or adjustment.
 pub enum Param<'a> {
@@ -522,8 +525,10 @@ impl Filter {
         }
     }
 
-    /// The filtered image (same size). Transparent pixels stay transparent unless the filter renders.
-    pub fn apply(&self, image: &RgbaImage) -> RgbaImage {
+    /// The filtered image (same size), at the depth of `image`: deep images are filtered in
+    /// floating point and keep values brighter than white where the filter allows it.
+    /// Transparent pixels stay transparent unless the filter renders.
+    pub fn apply<S: Sample>(&self, image: &Image<S>) -> Image<S> {
         if image.width() == 0 || image.height() == 0 {
             return image.clone();
         }
@@ -588,7 +593,7 @@ impl Filter {
                 monochrome,
                 gaussian,
             } => add_noise(image, amount, monochrome, gaussian),
-            Self::Median { radius } => rank_filter(image, radius, median),
+            Self::Median { radius } => rank_filter(image, radius, Rank::Median),
             Self::ReduceNoise { strength } => {
                 edge_blur(image, 2, strength.clamp(0.0, 10.0) * 4.0 + 1.0, false)
             }
@@ -656,7 +661,7 @@ impl Filter {
             Self::Displace { scale } => {
                 let soft = gaussian_blur(image, 2.0);
                 remap(image, move |x, y| {
-                    let d = (lum(px(&soft, x as i64, y as i64)) - 128.0) / 128.0 * scale;
+                    let d = (lum::<S>(px(&soft, x as i64, y as i64)) - 128.0) / 128.0 * scale;
                     (x + d, y + d)
                 })
             }
@@ -673,10 +678,10 @@ impl Filter {
             Self::Mezzotint => render(image.width(), image.height(), |x, y| {
                 let p = px(image, x as i64, y as i64);
                 let c = [0, 1, 2].map(|c| {
-                    if p[c] as f32 / 255.0 > hash(x, y, 50 + c as u32) {
-                        255
+                    if p[c] / 255.0 > hash(x, y, 50 + c as u32) {
+                        255.0
                     } else {
-                        0
+                        0.0
                     }
                 });
                 [c[0], c[1], c[2], p[3]]
@@ -695,9 +700,9 @@ impl Filter {
                 let m = sobel(image, x as i64, y as i64, 1);
                 let a = px(image, x as i64, y as i64)[3];
                 [
-                    to_u8(255.0 - m[0] / 4.0),
-                    to_u8(255.0 - m[1] / 4.0),
-                    to_u8(255.0 - m[2] / 4.0),
+                    255.0 - m[0] / 4.0,
+                    255.0 - m[1] / 4.0,
+                    255.0 - m[2] / 4.0,
                     a,
                 ]
             }),
@@ -708,11 +713,12 @@ impl Filter {
                 render(image.width(), image.height(), |x, y| {
                     let m = sobel(&soft, x as i64, y as i64, width as i64);
                     let a = px(image, x as i64, y as i64)[3];
-                    [to_u8(m[0] * k), to_u8(m[1] * k), to_u8(m[2] * k), a]
+                    [m[0] * k, m[1] * k, m[2] * k, a]
                 })
             }
-            Self::Solarize => map_pixels(image, |p| {
-                let s = |v: u8| if v > 127 { 255 - v } else { v };
+            Self::Solarize => render(image.width(), image.height(), |x, y| {
+                let p = get(image, x, y);
+                let s = |v: f32| if v > 127.5 { 255.0 - v } else { v };
                 [s(p[0]), s(p[1]), s(p[2]), p[3]]
             }),
             Self::TraceContour { level } => trace_contour(image, level),
@@ -729,8 +735,8 @@ impl Filter {
                 let clouds = clouds(image.width(), image.height(), seed);
                 render(image.width(), image.height(), |x, y| {
                     let t = clouds(x, y);
-                    let c = [0, 1, 2].map(|i| to_u8(lerp(bg[i] as f32, fg[i] as f32, t)));
-                    [c[0], c[1], c[2], 255]
+                    let c = [0, 1, 2].map(|i| lerp(bg[i] as f32, fg[i] as f32, t));
+                    [c[0], c[1], c[2], 255.0]
                 })
             }
             Self::DifferenceClouds { seed } => {
@@ -738,7 +744,7 @@ impl Filter {
                 render(image.width(), image.height(), |x, y| {
                     let p = px(image, x as i64, y as i64);
                     let v = clouds(x, y) * 255.0;
-                    let c = [0, 1, 2].map(|i| to_u8((p[i] as f32 - v).abs()));
+                    let c = [0, 1, 2].map(|i| (p[i] - v).abs());
                     [c[0], c[1], c[2], p[3]]
                 })
             }
@@ -747,8 +753,8 @@ impl Filter {
                 let v = fbm(fx / 4.0, fy / 90.0, 41, 4) * 0.7
                     + value_noise(fx / 1.5, fy / 30.0, 43) * 0.3;
                 let t = ((v - 0.5) * 2.4 + 0.5).clamp(0.0, 1.0);
-                let c = [0, 1, 2].map(|i| to_u8(lerp(bg[i] as f32, fg[i] as f32, t)));
-                [c[0], c[1], c[2], 255]
+                let c = [0, 1, 2].map(|i| lerp(bg[i] as f32, fg[i] as f32, t));
+                [c[0], c[1], c[2], 255.0]
             }),
             Self::LensFlare { center, brightness } => lens_flare(image, center, brightness),
             Self::LightingEffects {
@@ -759,16 +765,12 @@ impl Filter {
             Self::HighPass { radius } => {
                 let blurred = gaussian_blur(image, radius);
                 zip_pixels(image, &blurred, |p, b| {
-                    let c = [0, 1, 2].map(|i| to_u8(128.0 + p[i] as f32 - b[i] as f32));
+                    let c = [0, 1, 2].map(|i| 128.0 + p[i] - b[i]);
                     [c[0], c[1], c[2], p[3]]
                 })
             }
-            Self::Maximum { radius } => rank_filter(image, radius, |hist, _| {
-                hist.iter().rposition(|&n| n > 0).unwrap_or(0) as u8
-            }),
-            Self::Minimum { radius } => rank_filter(image, radius, |hist, _| {
-                hist.iter().position(|&n| n > 0).unwrap_or(0) as u8
-            }),
+            Self::Maximum { radius } => rank_filter(image, radius, Rank::Max),
+            Self::Minimum { radius } => rank_filter(image, radius, Rank::Min),
             Self::Offset { dx, dy, wrap } => offset(image, dx, dy, wrap),
             Self::Vignette { amount, midpoint } => vignette(image, amount, midpoint),
             Self::LensCorrection {
@@ -987,8 +989,9 @@ impl Filter {
 // ---------------------------------------------------------------- blur core
 
 /// Gaussian blur of about `radius` px (sigma), alpha-weighted so transparent pixels
-/// do not darken the edges. Three running-sum box passes per axis.
-pub fn gaussian_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
+/// do not darken the edges. Three running-sum box passes per axis. Works at every depth;
+/// deep values above full intensity are kept.
+pub fn gaussian_blur<S: Sample>(image: &Image<S>, radius: f32) -> Image<S> {
     if radius <= 0.0 || image.width() == 0 || image.height() == 0 {
         return image.clone();
     }
@@ -1007,16 +1010,16 @@ pub fn gaussian_blur_gray(mask: &GrayImage, radius: f32) -> GrayImage {
     GrayImage::from_raw(w, h, raw).expect("same size")
 }
 
-/// Plain box blur of `radius` px (window 2r+1), alpha-weighted.
-pub fn box_blur(image: &RgbaImage, radius: u32) -> RgbaImage {
+/// Plain box blur of `radius` px (window 2r+1), alpha-weighted, at every depth.
+pub fn box_blur<S: Sample>(image: &Image<S>, radius: u32) -> Image<S> {
     if radius == 0 || image.width() == 0 || image.height() == 0 {
         return image.clone();
     }
     blur_rgba(image, &[radius as usize])
 }
 
-fn blur_rgba(image: &RgbaImage, radii: &[usize]) -> RgbaImage {
-    let (w, h) = (image.width(), image.height());
+fn blur_rgba<S: Sample>(image: &Image<S>, radii: &[usize]) -> Image<S> {
+    let (w, h) = image.dimensions();
     let buf = blur_planes(to_premul(image), w as usize, h as usize, radii);
     from_premul(w, h, &buf)
 }
@@ -1096,45 +1099,66 @@ fn transpose<T: Copy + Send + Sync>(src: &[T], w: usize, h: usize) -> Vec<T> {
 }
 
 // ---------------------------------------------------------------- pixel plumbing
+//
+// Filters compute in a working scale where full intensity is 255 at every depth, so the
+// constants of the 8-bit maths hold for deep images too. 8-bit values stay whole numbers
+// and are rounded and clamped when stored, exactly as before; deep values keep their
+// fractions and may go above 255 (brighter than white).
 
-/// Premultiplied pixel: colour times alpha/255, alpha, all 0..255.
+/// Premultiplied pixel: colour times alpha/255, alpha, in the working scale.
 type Px = [f32; 4];
 
-fn premul(p: [u8; 4]) -> Px {
-    let a = p[3] as f32 / 255.0;
-    [
-        p[0] as f32 * a,
-        p[1] as f32 * a,
-        p[2] as f32 * a,
-        p[3] as f32,
-    ]
+/// A sample in the working scale.
+fn val<S: Sample>(v: S) -> f32 {
+    let v = v.unit() * 255.0;
+    if S::EIGHT { v.round() } else { v }
 }
 
-fn unpremul(p: Px) -> [u8; 4] {
+/// A working value stored as a sample: rounded and clamped at 8 bits, kept at 0 or more deep.
+fn put<S: Sample>(v: f32) -> S {
+    if S::EIGHT {
+        S::from_unit(v.round().clamp(0.0, 255.0) / 255.0)
+    } else {
+        S::from_unit(v / 255.0)
+    }
+}
+
+/// Four channels in the working scale.
+fn read<S: Sample>(p: &[S]) -> [f32; 4] {
+    [0, 1, 2, 3].map(|i| val(p[i]))
+}
+
+/// A pixel as it reads back once stored (8 bits: rounded, deep: unchanged).
+fn settle<S: Sample>(p: [f32; 4]) -> [f32; 4] {
+    p.map(|v| val(put::<S>(v)))
+}
+
+fn premul(p: [f32; 4]) -> Px {
+    let a = p[3] / 255.0;
+    [p[0] * a, p[1] * a, p[2] * a, p[3]]
+}
+
+fn unpremul(p: Px) -> [f32; 4] {
     if p[3] <= 0.001 || p[3].is_nan() {
-        return [0; 4];
+        return [0.0; 4];
     }
     let k = 255.0 / p[3];
-    [
-        to_u8(p[0] * k),
-        to_u8(p[1] * k),
-        to_u8(p[2] * k),
-        to_u8(p[3]),
-    ]
+    [p[0] * k, p[1] * k, p[2] * k, p[3]]
 }
 
-fn to_premul(image: &RgbaImage) -> Vec<Px> {
-    image
-        .par_chunks(4)
-        .map(|p| premul([p[0], p[1], p[2], p[3]]))
-        .collect()
+fn to_premul<S: Sample>(image: &Image<S>) -> Vec<Px> {
+    image.par_chunks(4).map(|p| premul(read(p))).collect()
 }
 
-fn from_premul(w: u32, h: u32, buf: &[Px]) -> RgbaImage {
-    let mut out = RgbaImage::new(w, h);
+fn from_premul<S: Sample>(w: u32, h: u32, buf: &[Px]) -> Image<S> {
+    let mut out = Image::<S>::new(w, h);
     out.par_chunks_mut(4)
         .zip(buf.par_iter())
-        .for_each(|(o, p)| o.copy_from_slice(&unpremul(*p)));
+        .for_each(|(o, p)| {
+            for (o, v) in o.iter_mut().zip(unpremul(*p)) {
+                *o = put(v);
+            }
+        });
     out
 }
 
@@ -1151,34 +1175,44 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn lum(p: [u8; 4]) -> f32 {
-    luma(p[0], p[1], p[2]) as f32
+/// Brightness in the working scale; 8 bits keep the whole-number luma used across the app.
+fn lum<S: Sample>(p: [f32; 4]) -> f32 {
+    if S::EIGHT {
+        luma(p[0] as u8, p[1] as u8, p[2] as u8) as f32
+    } else {
+        0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]
+    }
 }
 
-fn dims(image: &RgbaImage) -> (f32, f32) {
+fn dims<S: Sample>(image: &Image<S>) -> (f32, f32) {
     (image.width() as f32, image.height() as f32)
 }
 
 /// A center given as fractions, in pixels.
-fn at(image: &RgbaImage, center: (f32, f32)) -> (f32, f32) {
+fn at<S: Sample>(image: &Image<S>, center: (f32, f32)) -> (f32, f32) {
     let (w, h) = dims(image);
     (center.0 * (w - 1.0), center.1 * (h - 1.0))
 }
 
-fn half_diagonal(image: &RgbaImage) -> f32 {
+fn half_diagonal<S: Sample>(image: &Image<S>) -> f32 {
     let (w, h) = dims(image);
     (w.hypot(h) / 2.0).max(1.0)
 }
 
+/// Pixel at (x, y) in the working scale.
+fn get<S: Sample>(image: &Image<S>, x: u32, y: u32) -> [f32; 4] {
+    read(image.get_pixel(x, y).channels())
+}
+
 /// Pixel at (x, y), edges repeated.
-fn px(image: &RgbaImage, x: i64, y: i64) -> [u8; 4] {
+fn px<S: Sample>(image: &Image<S>, x: i64, y: i64) -> [f32; 4] {
     let x = x.clamp(0, image.width() as i64 - 1) as u32;
     let y = y.clamp(0, image.height() as i64 - 1) as u32;
-    image.get_pixel(x, y).0
+    get(image, x, y)
 }
 
 /// Bilinear premultiplied sample, pixel centers at whole numbers, edges repeated.
-fn sample(image: &RgbaImage, x: f32, y: f32) -> Px {
+fn sample<S: Sample>(image: &Image<S>, x: f32, y: f32) -> Px {
     let (w, h) = dims(image);
     let x = x.clamp(0.0, w - 1.0);
     let y = y.clamp(0.0, h - 1.0);
@@ -1190,8 +1224,8 @@ fn sample(image: &RgbaImage, x: f32, y: f32) -> Px {
 }
 
 /// Build an image row by row in parallel.
-fn render_rows(w: u32, h: u32, f: impl Fn(u32, &mut [u8]) + Sync) -> RgbaImage {
-    let mut out = RgbaImage::new(w, h);
+fn render_rows<S: Sample>(w: u32, h: u32, f: impl Fn(u32, &mut [S]) + Sync) -> Image<S> {
+    let mut out = Image::<S>::new(w, h);
     if w == 0 || h == 0 {
         return out;
     }
@@ -1201,54 +1235,49 @@ fn render_rows(w: u32, h: u32, f: impl Fn(u32, &mut [u8]) + Sync) -> RgbaImage {
     out
 }
 
-/// Build an image pixel by pixel in parallel.
-fn render(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4] + Sync) -> RgbaImage {
+/// Build an image pixel by pixel in parallel, from working-scale pixels.
+fn render<S: Sample>(w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4] + Sync) -> Image<S> {
     render_rows(w, h, |y, row| {
         for (x, p) in row.chunks_mut(4).enumerate() {
-            p.copy_from_slice(&f(x as u32, y));
+            for (o, v) in p.iter_mut().zip(f(x as u32, y)) {
+                *o = put(v);
+            }
         }
     })
 }
 
-fn map_pixels(image: &RgbaImage, f: impl Fn([u8; 4]) -> [u8; 4] + Sync) -> RgbaImage {
-    let mut out = image.clone();
-    out.par_chunks_mut(4).for_each(|p| {
-        let new = f([p[0], p[1], p[2], p[3]]);
-        p.copy_from_slice(&new);
-    });
-    out
-}
-
-fn zip_pixels(
-    image: &RgbaImage,
-    other: &RgbaImage,
-    f: impl Fn([u8; 4], [u8; 4]) -> [u8; 4] + Sync,
-) -> RgbaImage {
+fn zip_pixels<S: Sample>(
+    image: &Image<S>,
+    other: &Image<S>,
+    f: impl Fn([f32; 4], [f32; 4]) -> [f32; 4] + Sync,
+) -> Image<S> {
     let mut out = image.clone();
     out.par_chunks_mut(4)
         .zip(other.par_chunks(4))
         .for_each(|(p, o)| {
-            let new = f([p[0], p[1], p[2], p[3]], [o[0], o[1], o[2], o[3]]);
-            p.copy_from_slice(&new);
+            let new = f(read(p), read(o));
+            for (d, v) in p.iter_mut().zip(new) {
+                *d = put(v);
+            }
         });
     out
 }
 
 /// Mix `image` toward `other` by `amount(x, y)` 0..1.
-fn blend_by(
-    image: &RgbaImage,
-    other: &RgbaImage,
+fn blend_by<S: Sample>(
+    image: &Image<S>,
+    other: &Image<S>,
     amount: impl Fn(u32, u32) -> f32 + Sync,
-) -> RgbaImage {
+) -> Image<S> {
     render(image.width(), image.height(), |x, y| {
-        let (a, b) = (image.get_pixel(x, y).0, other.get_pixel(x, y).0);
+        let (a, b) = (get(image, x, y), get(other, x, y));
         let t = amount(x, y);
-        [0, 1, 2, 3].map(|i| to_u8(lerp(a[i] as f32, b[i] as f32, t)))
+        [0, 1, 2, 3].map(|i| lerp(a[i], b[i], t))
     })
 }
 
 /// Each output pixel samples the source where `f` says.
-fn remap(image: &RgbaImage, f: impl Fn(f32, f32) -> (f32, f32) + Sync) -> RgbaImage {
+fn remap<S: Sample>(image: &Image<S>, f: impl Fn(f32, f32) -> (f32, f32) + Sync) -> Image<S> {
     render(image.width(), image.height(), |x, y| {
         let (sx, sy) = f(x as f32, y as f32);
         unpremul(sample(image, sx, sy))
@@ -1256,7 +1285,10 @@ fn remap(image: &RgbaImage, f: impl Fn(f32, f32) -> (f32, f32) + Sync) -> RgbaIm
 }
 
 /// Distort inside the circle around the image center: `f(r, dx, dy)` gives the source offset.
-fn radial_map(image: &RgbaImage, f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync) -> RgbaImage {
+fn radial_map<S: Sample>(
+    image: &Image<S>,
+    f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync,
+) -> Image<S> {
     let (cx, cy) = at(image, (0.5, 0.5));
     let reach = (cx.min(cy) + 0.5).max(1.0);
     remap(image, |x, y| {
@@ -1271,7 +1303,7 @@ fn radial_map(image: &RgbaImage, f: impl Fn(f32, f32, f32) -> (f32, f32) + Sync)
 }
 
 /// Radial distortion where `f` maps a normalized radius to the source radius.
-fn radial_scale(image: &RgbaImage, f: impl Fn(f32) -> f32 + Sync) -> RgbaImage {
+fn radial_scale<S: Sample>(image: &Image<S>, f: impl Fn(f32) -> f32 + Sync) -> Image<S> {
     radial_map(image, |r, dx, dy| {
         let k = f(r) / r;
         (dx * k, dy * k)
@@ -1279,11 +1311,11 @@ fn radial_scale(image: &RgbaImage, f: impl Fn(f32) -> f32 + Sync) -> RgbaImage {
 }
 
 /// Mean of `n` premultiplied samples at the positions `f(x, y, i)`.
-fn average(
-    image: &RgbaImage,
+fn average<S: Sample>(
+    image: &Image<S>,
     n: usize,
     f: impl Fn(f32, f32, usize) -> (f32, f32) + Sync,
-) -> RgbaImage {
+) -> Image<S> {
     let n = n.max(1);
     render(image.width(), image.height(), |x, y| {
         let mut acc = [0.0; 4];
@@ -1299,7 +1331,13 @@ fn average(
 }
 
 /// Convolution of the colour channels (alpha kept), edges repeated.
-fn convolve(image: &RgbaImage, kernel: &[f32], size: usize, scale: f32, offset: f32) -> RgbaImage {
+fn convolve<S: Sample>(
+    image: &Image<S>,
+    kernel: &[f32],
+    size: usize,
+    scale: f32,
+    offset: f32,
+) -> Image<S> {
     let half = (size / 2) as i64;
     let scale = if scale.abs() < 1e-6 { 1.0 } else { scale };
     render(image.width(), image.height(), |x, y| {
@@ -1311,24 +1349,23 @@ fn convolve(image: &RgbaImage, kernel: &[f32], size: usize, scale: f32, offset: 
             let (dx, dy) = ((i % size) as i64 - half, (i / size) as i64 - half);
             let p = px(image, x as i64 + dx, y as i64 + dy);
             for (a, v) in acc.iter_mut().zip(p) {
-                *a += k * v as f32;
+                *a += k * v;
             }
         }
-        let c = acc.map(|a| to_u8(a / scale + offset));
-        [c[0], c[1], c[2], image.get_pixel(x, y)[3]]
+        let c = acc.map(|a| a / scale + offset);
+        [c[0], c[1], c[2], get(image, x, y)[3]]
     })
 }
 
 /// Sobel gradient magnitude per colour channel, taps `step` px apart.
-fn sobel(image: &RgbaImage, x: i64, y: i64, step: i64) -> [f32; 3] {
+fn sobel<S: Sample>(image: &Image<S>, x: i64, y: i64, step: i64) -> [f32; 3] {
     let g = |dx: i64, dy: i64| px(image, x + dx * step, y + dy * step);
     let (tl, t, tr) = (g(-1, -1), g(0, -1), g(1, -1));
     let (l, r) = (g(-1, 0), g(1, 0));
     let (bl, b, br) = (g(-1, 1), g(0, 1), g(1, 1));
     [0, 1, 2].map(|c| {
-        let f = |p: [u8; 4]| p[c] as f32;
-        let gx = f(tr) + 2.0 * f(r) + f(br) - f(tl) - 2.0 * f(l) - f(bl);
-        let gy = f(bl) + 2.0 * f(b) + f(br) - f(tl) - 2.0 * f(t) - f(tr);
+        let gx = tr[c] + 2.0 * r[c] + br[c] - tl[c] - 2.0 * l[c] - bl[c];
+        let gy = bl[c] + 2.0 * b[c] + br[c] - tl[c] - 2.0 * t[c] - tr[c];
         gx.hypot(gy)
     })
 }
@@ -1379,7 +1416,7 @@ fn clouds(w: u32, h: u32, seed: u32) -> impl Fn(u32, u32) -> f32 + Sync {
 
 // ---------------------------------------------------------------- blurs
 
-fn motion_blur(image: &RgbaImage, angle: f32, distance: f32) -> RgbaImage {
+fn motion_blur<S: Sample>(image: &Image<S>, angle: f32, distance: f32) -> Image<S> {
     if distance < 1.0 {
         return image.clone();
     }
@@ -1391,7 +1428,12 @@ fn motion_blur(image: &RgbaImage, angle: f32, distance: f32) -> RgbaImage {
     })
 }
 
-fn radial_blur(image: &RgbaImage, amount: f32, zoom: bool, center: (f32, f32)) -> RgbaImage {
+fn radial_blur<S: Sample>(
+    image: &Image<S>,
+    amount: f32,
+    zoom: bool,
+    center: (f32, f32),
+) -> Image<S> {
     let (cx, cy) = at(image, center);
     let k = amount.clamp(0.0, 100.0) / 100.0;
     let n = 48;
@@ -1410,32 +1452,30 @@ fn radial_blur(image: &RgbaImage, amount: f32, zoom: bool, center: (f32, f32)) -
 
 /// Blur that leaves edges: neighbours count less the more they differ from the pixel.
 /// `hard`: neighbours beyond `threshold` (in luma) are ignored outright.
-fn edge_blur(image: &RgbaImage, radius: u32, threshold: f32, hard: bool) -> RgbaImage {
+fn edge_blur<S: Sample>(image: &Image<S>, radius: u32, threshold: f32, hard: bool) -> Image<S> {
     let r = radius.max(1) as i64;
     // shortcut: big radii sample a sparse grid (about 13x13), exact up to radius 6.
     let step = (r / 6).max(1) as usize;
     let t = threshold.max(1.0);
     render(image.width(), image.height(), |x, y| {
-        let own = image.get_pixel(x, y).0;
+        let own = get(image, x, y);
         let mut acc = [0.0f32; 3];
         let mut weight = 0.0;
         for dy in (-r..=r).step_by(step) {
             for dx in (-r..=r).step_by(step) {
                 let n = px(image, x as i64 + dx, y as i64 + dy);
                 let wgt = if hard {
-                    if (lum(n) - lum(own)).abs() <= t {
+                    if (lum::<S>(n) - lum::<S>(own)).abs() <= t {
                         1.0
                     } else {
                         0.0
                     }
                 } else {
-                    let diff = (0..3)
-                        .map(|c| (n[c] as f32 - own[c] as f32).abs())
-                        .fold(0.0, f32::max);
+                    let diff = (0..3).map(|c| (n[c] - own[c]).abs()).fold(0.0, f32::max);
                     (1.0 - diff / (2.5 * t)).max(0.0)
-                } * n[3] as f32;
+                } * n[3];
                 for (a, v) in acc.iter_mut().zip(n) {
-                    *a += wgt * v as f32;
+                    *a += wgt * v;
                 }
                 weight += wgt;
             }
@@ -1443,13 +1483,13 @@ fn edge_blur(image: &RgbaImage, radius: u32, threshold: f32, hard: bool) -> Rgba
         if weight <= 0.0 {
             return own;
         }
-        let c = acc.map(|a| to_u8(a / weight));
+        let c = acc.map(|a| a / weight);
         [c[0], c[1], c[2], own[3]]
     })
 }
 
 /// Disc blur where bright points weigh more, giving round highlights.
-fn lens_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
+fn lens_blur<S: Sample>(image: &Image<S>, radius: f32) -> Image<S> {
     if radius < 0.5 {
         return image.clone();
     }
@@ -1480,14 +1520,14 @@ fn lens_blur(image: &RgbaImage, radius: f32) -> RgbaImage {
 
 // ---------------------------------------------------------------- sharpen
 
-fn unsharp(image: &RgbaImage, amount: f32, radius: f32, threshold: u8) -> RgbaImage {
+fn unsharp<S: Sample>(image: &Image<S>, amount: f32, radius: f32, threshold: u8) -> Image<S> {
     let blurred = gaussian_blur(image, radius);
     let k = amount / 100.0;
     zip_pixels(image, &blurred, |p, b| {
         let c = [0, 1, 2].map(|i| {
-            let d = p[i] as f32 - b[i] as f32;
+            let d = p[i] - b[i];
             if d.abs() >= threshold as f32 {
-                to_u8(p[i] as f32 + d * k)
+                p[i] + d * k
             } else {
                 p[i]
             }
@@ -1497,26 +1537,26 @@ fn unsharp(image: &RgbaImage, amount: f32, radius: f32, threshold: u8) -> RgbaIm
 }
 
 /// Sharpen the brightness only, so edges get no colour halos.
-fn smart_sharpen(image: &RgbaImage, amount: f32, radius: f32) -> RgbaImage {
+fn smart_sharpen<S: Sample>(image: &Image<S>, amount: f32, radius: f32) -> Image<S> {
     let blurred = gaussian_blur(image, radius);
     let k = amount / 100.0;
     zip_pixels(image, &blurred, |p, b| {
-        let d = (lum(p) - lum(b)) * k;
-        [
-            to_u8(p[0] as f32 + d),
-            to_u8(p[1] as f32 + d),
-            to_u8(p[2] as f32 + d),
-            p[3],
-        ]
+        let d = (lum::<S>(p) - lum::<S>(b)) * k;
+        [p[0] + d, p[1] + d, p[2] + d, p[3]]
     })
 }
 
 // ---------------------------------------------------------------- noise
 
-fn add_noise(image: &RgbaImage, amount: f32, monochrome: bool, gaussian: bool) -> RgbaImage {
+fn add_noise<S: Sample>(
+    image: &Image<S>,
+    amount: f32,
+    monochrome: bool,
+    gaussian: bool,
+) -> Image<S> {
     let amp = amount / 100.0 * 128.0;
     render(image.width(), image.height(), |x, y| {
-        let p = image.get_pixel(x, y).0;
+        let p = get(image, x, y);
         let n = |c: u32| {
             let c = if monochrome { 0 } else { c };
             if gaussian {
@@ -1525,20 +1565,27 @@ fn add_noise(image: &RgbaImage, amount: f32, monochrome: bool, gaussian: bool) -
                 (hash(x, y, c) - 0.5) * 2.0
             }
         };
-        let c = [0, 1, 2].map(|i| to_u8(p[i] as f32 + n(i as u32) * amp));
+        let c = [0, 1, 2].map(|i| p[i] + n(i as u32) * amp);
         [c[0], c[1], c[2], p[3]]
     })
 }
 
-/// Per-channel rank filter over a square window, with a sliding histogram per row.
-/// `pick(histogram, count)` chooses the value. Alpha is kept.
-fn rank_filter(
-    image: &RgbaImage,
-    radius: u32,
-    pick: impl Fn(&[u32; 256], u32) -> u8 + Sync,
-) -> RgbaImage {
+/// Which value of a sorted window a rank filter keeps.
+#[derive(Clone, Copy)]
+enum Rank {
+    Median,
+    Max,
+    Min,
+}
+
+/// Per-channel rank filter over a square window. Alpha is kept. 8 bits slide a histogram
+/// along each row; deep images sort each window.
+fn rank_filter<S: Sample>(image: &Image<S>, radius: u32, rank: Rank) -> Image<S> {
     let r = radius.max(1) as i64;
-    let (w, h) = (image.width(), image.height());
+    if !S::EIGHT {
+        return rank_window(image, r, rank);
+    }
+    let (w, h) = image.dimensions();
     let count = ((2 * r + 1) * (2 * r + 1)) as u32;
     render_rows(w, h, |y, row| {
         let y = y as i64;
@@ -1558,7 +1605,7 @@ fn rank_filter(
         for (x, out) in row.chunks_mut(4).enumerate() {
             let x = x as i64;
             for (o, bins) in out.iter_mut().zip(&hist) {
-                *o = pick(bins, count);
+                *o = put(pick(bins, count, rank));
             }
             out[3] = image.get_pixel(x as u32, y as u32)[3];
             if x + 1 < w as i64 {
@@ -1569,22 +1616,56 @@ fn rank_filter(
     })
 }
 
-fn median(hist: &[u32; 256], count: u32) -> u8 {
-    let mut seen = 0;
-    for (v, &n) in hist.iter().enumerate() {
-        seen += n;
-        if seen > count / 2 {
-            return v as u8;
+fn pick(hist: &[u32; 256], count: u32, rank: Rank) -> f32 {
+    let v = match rank {
+        Rank::Median => {
+            let mut seen = 0;
+            hist.iter()
+                .position(|&n| {
+                    seen += n;
+                    seen > count / 2
+                })
+                .unwrap_or(255)
         }
-    }
-    255
+        Rank::Max => hist.iter().rposition(|&n| n > 0).unwrap_or(0),
+        Rank::Min => hist.iter().position(|&n| n > 0).unwrap_or(0),
+    };
+    v as f32
+}
+
+/// Rank filter on deep values.
+/// shortcut: sorts the whole window per pixel (radius squared work), slow past radius ~20 on big
+/// images; switch to a sliding sorted window if that matters.
+fn rank_window<S: Sample>(image: &Image<S>, r: i64, rank: Rank) -> Image<S> {
+    let n = ((2 * r + 1) * (2 * r + 1)) as usize;
+    let k = match rank {
+        Rank::Median => n / 2,
+        Rank::Max => n - 1,
+        Rank::Min => 0,
+    };
+    render(image.width(), image.height(), |x, y| {
+        let (x, y) = (x as i64, y as i64);
+        let taps: Vec<[f32; 4]> = (-r..=r)
+            .flat_map(|dy| (-r..=r).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| px(image, x + dx, y + dy))
+            .collect();
+        let mut out = px(image, x, y);
+        let mut channel = vec![0.0; n];
+        for (c, o) in out.iter_mut().take(3).enumerate() {
+            for (v, t) in channel.iter_mut().zip(&taps) {
+                *v = t[c];
+            }
+            *o = *channel.select_nth_unstable_by(k, f32::total_cmp).1;
+        }
+        out
+    })
 }
 
 /// Median only where the pixel stands out from it by more than `threshold`.
-fn dust(image: &RgbaImage, radius: u32, threshold: u8) -> RgbaImage {
-    let med = rank_filter(image, radius, median);
+fn dust<S: Sample>(image: &Image<S>, radius: u32, threshold: u8) -> Image<S> {
+    let med = rank_filter(image, radius, Rank::Median);
     zip_pixels(image, &med, |p, m| {
-        if (lum(p) - lum(m)).abs() > threshold as f32 {
+        if (lum::<S>(p) - lum::<S>(m)).abs() > threshold as f32 {
             [m[0], m[1], m[2], p[3]]
         } else {
             p
@@ -1594,7 +1675,7 @@ fn dust(image: &RgbaImage, radius: u32, threshold: u8) -> RgbaImage {
 
 // ---------------------------------------------------------------- distort
 
-fn polar(image: &RgbaImage, to_polar: bool) -> RgbaImage {
+fn polar<S: Sample>(image: &Image<S>, to_polar: bool) -> Image<S> {
     let (w, h) = dims(image);
     let (cx, cy) = at(image, (0.5, 0.5));
     let reach = (cx.min(cy) + 0.5).max(1.0);
@@ -1616,8 +1697,8 @@ fn polar(image: &RgbaImage, to_polar: bool) -> RgbaImage {
 // ---------------------------------------------------------------- pixelate
 
 /// Mean colour of each `size` block, row-major, and the number of blocks per row.
-fn block_means(image: &RgbaImage, size: u32) -> (Vec<[u8; 4]>, u32) {
-    let (w, h) = (image.width(), image.height());
+fn block_means<S: Sample>(image: &Image<S>, size: u32) -> (Vec<[f32; 4]>, u32) {
+    let (w, h) = image.dimensions();
     let (bw, bh) = (w.div_ceil(size), h.div_ceil(size));
     let means = (0..bw * bh)
         .into_par_iter()
@@ -1627,20 +1708,20 @@ fn block_means(image: &RgbaImage, size: u32) -> (Vec<[u8; 4]>, u32) {
             let mut n = 0.0;
             for y in by..(by + size).min(h) {
                 for x in bx..(bx + size).min(w) {
-                    for (a, v) in acc.iter_mut().zip(premul(image.get_pixel(x, y).0)) {
+                    for (a, v) in acc.iter_mut().zip(premul(get(image, x, y))) {
                         *a += v;
                     }
                     n += 1.0;
                 }
             }
-            unpremul(acc.map(|a| a / n))
+            settle::<S>(unpremul(acc.map(|a| a / n)))
         })
         .collect();
     (means, bw)
 }
 
 /// Voronoi cells over jittered grid points. Pointillize leaves white paper between round dots.
-fn crystallize(image: &RgbaImage, size: u32, dots: bool) -> RgbaImage {
+fn crystallize<S: Sample>(image: &Image<S>, size: u32, dots: bool) -> Image<S> {
     let s = size.max(2) as f32;
     let seed_of = |gx: i64, gy: i64| {
         let (ux, uy) = (gx as u32, gy as u32);
@@ -1664,7 +1745,7 @@ fn crystallize(image: &RgbaImage, size: u32, dots: bool) -> RgbaImage {
         }
         let color = px(image, best.1.round() as i64, best.2.round() as i64);
         if dots && best.0 > s * 0.55 {
-            [255, 255, 255, image.get_pixel(x, y)[3]]
+            [255.0, 255.0, 255.0, get(image, x, y)[3]]
         } else {
             color
         }
@@ -1672,12 +1753,12 @@ fn crystallize(image: &RgbaImage, size: u32, dots: bool) -> RgbaImage {
 }
 
 /// Each channel printed as a rotated grid of dots sized by its ink.
-fn halftone(image: &RgbaImage, radius: u32) -> RgbaImage {
+fn halftone<S: Sample>(image: &Image<S>, radius: u32) -> Image<S> {
     let cell = radius.max(2) as f32 * 2.0;
     let angles = [108f32, 162.0, 90.0].map(|a| a.to_radians().sin_cos());
     render(image.width(), image.height(), |x, y| {
         let (fx, fy) = (x as f32, y as f32);
-        let mut out = [0u8; 4];
+        let mut out = [0.0; 4];
         for (c, &(sn, cs)) in angles.iter().enumerate() {
             let (u, v) = (fx * cs + fy * sn, -fx * sn + fy * cs);
             let (gu, gv) = ((u / cell).floor(), (v / cell).floor());
@@ -1686,22 +1767,22 @@ fn halftone(image: &RgbaImage, radius: u32) -> RgbaImage {
                 for i in -1..=1 {
                     let (mu, mv) = ((gu + i as f32 + 0.5) * cell, (gv + j as f32 + 0.5) * cell);
                     let (ix, iy) = (mu * cs - mv * sn, mu * sn + mv * cs);
-                    let ink =
-                        1.0 - px(image, ix.round() as i64, iy.round() as i64)[c] as f32 / 255.0;
+                    let tone = px(image, ix.round() as i64, iy.round() as i64)[c] / 255.0;
+                    let ink = (1.0 - tone).clamp(0.0, 1.0);
                     let dot = cell * 0.5 * std::f32::consts::SQRT_2 * ink.sqrt();
                     let d = (u - mu).hypot(v - mv);
                     cover = cover.max((dot - d + 0.5).clamp(0.0, 1.0));
                 }
             }
-            out[c] = to_u8(255.0 * (1.0 - cover));
+            out[c] = 255.0 * (1.0 - cover);
         }
-        out[3] = image.get_pixel(x, y)[3];
+        out[3] = get(image, x, y)[3];
         out
     })
 }
 
 /// Mean of the least varied of the four quadrants around each pixel: flat facets, edges kept.
-fn kuwahara(image: &RgbaImage, r: i64) -> RgbaImage {
+fn kuwahara<S: Sample>(image: &Image<S>, r: i64) -> Image<S> {
     render(image.width(), image.height(), |x, y| {
         let (x, y) = (x as i64, y as i64);
         let mut best = (f32::MAX, [0.0f32; 3]);
@@ -1711,9 +1792,9 @@ fn kuwahara(image: &RgbaImage, r: i64) -> RgbaImage {
                 for dx in qx..=qx + r {
                     let p = px(image, x + dx, y + dy);
                     for (s, v) in sum.iter_mut().zip(p) {
-                        *s += v as f32;
+                        *s += v;
                     }
-                    let l = lum(p);
+                    let l = lum::<S>(p);
                     sl += l;
                     sl2 += l * l;
                     n += 1.0;
@@ -1724,14 +1805,14 @@ fn kuwahara(image: &RgbaImage, r: i64) -> RgbaImage {
                 best = (var, sum.map(|s| s / n));
             }
         }
-        let c = best.1.map(to_u8);
+        let c = best.1;
         [c[0], c[1], c[2], px(image, x, y)[3]]
     })
 }
 
 // ---------------------------------------------------------------- stylize
 
-fn emboss(image: &RgbaImage, angle: f32, height: f32, amount: f32) -> RgbaImage {
+fn emboss<S: Sample>(image: &Image<S>, angle: f32, height: f32, amount: f32) -> Image<S> {
     let (s, c) = angle.to_radians().sin_cos();
     let reach = (height / 2.0).max(0.5);
     let (ox, oy) = (c * reach, -s * reach);
@@ -1742,12 +1823,14 @@ fn emboss(image: &RgbaImage, angle: f32, height: f32, amount: f32) -> RgbaImage 
             let p = sample(image, sx, sy);
             (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / p[3].max(1.0) * 255.0
         };
-        let v = to_u8(128.0 + (l(fx + ox, fy + oy) - l(fx - ox, fy - oy)) * k);
-        [v, v, v, image.get_pixel(x, y)[3]]
+        let v = 128.0 + (l(fx + ox, fy + oy) - l(fx - ox, fy - oy)) * k;
+        [v, v, v, get(image, x, y)[3]]
     })
 }
 
-fn trace_contour(image: &RgbaImage, level: u8) -> RgbaImage {
+fn trace_contour<S: Sample>(image: &Image<S>, level: u8) -> Image<S> {
+    // Half a level below, so whole 8-bit values compare as before and deep ones round fairly.
+    let level = level as f32 - 0.5;
     render(image.width(), image.height(), |x, y| {
         let (xi, yi) = (x as i64, y as i64);
         let (p, right, down) = (
@@ -1758,9 +1841,9 @@ fn trace_contour(image: &RgbaImage, level: u8) -> RgbaImage {
         let c = [0, 1, 2].map(|i| {
             let up = p[i] >= level;
             if up != (right[i] >= level) || up != (down[i] >= level) {
-                0
+                0.0
             } else {
-                255
+                255.0
             }
         });
         [c[0], c[1], c[2], p[3]]
@@ -1768,24 +1851,24 @@ fn trace_contour(image: &RgbaImage, level: u8) -> RgbaImage {
 }
 
 /// Bright streaks blown to the right, each fading at its own random rate.
-fn wind(image: &RgbaImage, strength: u32) -> RgbaImage {
+fn wind<S: Sample>(image: &Image<S>, strength: u32) -> Image<S> {
     let strength = strength.max(1) as f32;
     render_rows(image.width(), image.height(), |y, row| {
         let mut trail = [0.0f32; 3];
         for (x, out) in row.chunks_mut(4).enumerate() {
-            let p = image.get_pixel(x as u32, y).0;
+            let p = get(image, x as u32, y);
             let keep = 1.0 - 1.0 / (strength * (0.3 + hash(x as u32, y, 11)) * 1.5 + 1.0);
             for ((t, o), v) in trail.iter_mut().zip(out.iter_mut()).zip(p) {
-                *t = (*t * keep).max(v as f32);
-                *o = to_u8(*t);
+                *t = (*t * keep).max(v);
+                *o = put(*t);
             }
-            out[3] = p[3];
+            out[3] = image.get_pixel(x as u32, y)[3];
         }
     })
 }
 
 /// Blocks of mean colour shaped as lit pyramids.
-fn extrude(image: &RgbaImage, size: u32, depth: u32) -> RgbaImage {
+fn extrude<S: Sample>(image: &Image<S>, size: u32, depth: u32) -> Image<S> {
     let size = size.max(2);
     let (means, bw) = block_means(image, size);
     let strength = (depth as f32 / 100.0).min(1.5);
@@ -1802,17 +1885,12 @@ fn extrude(image: &RgbaImage, size: u32, depth: u32) -> RgbaImage {
             )
             .1;
         let k = 1.0 + shade * strength;
-        [
-            to_u8(m[0] as f32 * k),
-            to_u8(m[1] as f32 * k),
-            to_u8(m[2] as f32 * k),
-            m[3],
-        ]
+        [m[0] * k, m[1] * k, m[2] * k, m[3]]
     })
 }
 
 /// Square tiles nudged at random, white showing in the gaps.
-fn tiles(image: &RgbaImage, count: u32) -> RgbaImage {
+fn tiles<S: Sample>(image: &Image<S>, count: u32) -> Image<S> {
     let s = (image.width() as f32 / count.max(1) as f32).max(2.0);
     let max_off = s * 0.1;
     let (w, h) = dims(image);
@@ -1833,12 +1911,12 @@ fn tiles(image: &RgbaImage, count: u32) -> RgbaImage {
                 }
             }
         }
-        found.unwrap_or([255, 255, 255, image.get_pixel(x, y)[3]])
+        found.unwrap_or([255.0, 255.0, 255.0, get(image, x, y)[3]])
     })
 }
 
 /// Most common brightness level in the window, painted with that level's mean colour.
-fn oil_paint(image: &RgbaImage, radius: u32, levels: u8) -> RgbaImage {
+fn oil_paint<S: Sample>(image: &Image<S>, radius: u32, levels: u8) -> Image<S> {
     let r = radius.max(1) as i64;
     let levels = levels.max(2) as usize;
     render_rows(image.width(), image.height(), |y, row| {
@@ -1850,17 +1928,19 @@ fn oil_paint(image: &RgbaImage, radius: u32, levels: u8) -> RgbaImage {
             for dy in -r..=r {
                 for dx in -r..=r {
                     let p = px(image, x as i64 + dx, y as i64 + dy);
-                    let bin = (lum(p) / 255.0 * (levels - 1) as f32).round() as usize;
+                    // Brighter than white (deep only) joins the top level.
+                    let bin = ((lum::<S>(p) / 255.0 * (levels - 1) as f32).round() as usize)
+                        .min(levels - 1);
                     count[bin] += 1;
                     for (s, v) in sums[bin].iter_mut().zip(p) {
-                        *s += v as f32;
+                        *s += v;
                     }
                 }
             }
             let best = (0..levels).max_by_key(|&b| count[b]).unwrap_or(0);
             let n = count[best].max(1) as f32;
             for (o, s) in out.iter_mut().zip(sums[best]) {
-                *o = to_u8(s / n);
+                *o = put(s / n);
             }
             out[3] = image.get_pixel(x as u32, y)[3];
         }
@@ -1869,7 +1949,7 @@ fn oil_paint(image: &RgbaImage, radius: u32, levels: u8) -> RgbaImage {
 
 // ---------------------------------------------------------------- render
 
-fn lens_flare(image: &RgbaImage, center: (f32, f32), brightness: f32) -> RgbaImage {
+fn lens_flare<S: Sample>(image: &Image<S>, center: (f32, f32), brightness: f32) -> Image<S> {
     let (cx, cy) = at(image, center);
     let (mx, my) = at(image, (0.5, 0.5));
     let diag = half_diagonal(image) * 2.0;
@@ -1883,7 +1963,7 @@ fn lens_flare(image: &RgbaImage, center: (f32, f32), brightness: f32) -> RgbaIma
         (2.0, 0.08, [0.4, 0.6, 1.0]),
     ];
     render(image.width(), image.height(), |x, y| {
-        let p = image.get_pixel(x, y).0;
+        let p = get(image, x, y);
         let (dx, dy) = (x as f32 - cx, y as f32 - cy);
         let d = dx.hypot(dy) / diag;
         let core = (-(d / 0.025).powi(2)).exp() + 0.35 * (-d / 0.12).exp();
@@ -1906,30 +1986,29 @@ fn lens_flare(image: &RgbaImage, center: (f32, f32), brightness: f32) -> RgbaIma
             }
         }
         let add = add.map(|a| (a * k).clamp(0.0, 1.0));
-        let c =
-            [0, 1, 2].map(|i| to_u8(255.0 * (1.0 - (1.0 - p[i] as f32 / 255.0) * (1.0 - add[i]))));
-        let glow = to_u8(add[0].max(add[1]).max(add[2]) * 255.0);
+        let c = [0, 1, 2].map(|i| 255.0 * (1.0 - (1.0 - p[i] / 255.0) * (1.0 - add[i])));
+        let glow = add[0].max(add[1]).max(add[2]) * 255.0;
         [c[0], c[1], c[2], p[3].max(glow)]
     })
 }
 
 /// A directional light raking across the image, its brightness used as a bump map.
-fn lighting(image: &RgbaImage, angle: f32, intensity: f32, color: [u8; 3]) -> RgbaImage {
+fn lighting<S: Sample>(image: &Image<S>, angle: f32, intensity: f32, color: [u8; 3]) -> Image<S> {
     let (s, c) = angle.to_radians().sin_cos();
     let elevation = 45f32.to_radians();
     let light = [c * elevation.cos(), -s * elevation.cos(), elevation.sin()];
     let k = intensity / 100.0;
     render(image.width(), image.height(), |x, y| {
         let (xi, yi) = (x as i64, y as i64);
-        let l = |dx: i64, dy: i64| lum(px(image, xi + dx, yi + dy)) / 255.0;
+        let l = |dx: i64, dy: i64| lum::<S>(px(image, xi + dx, yi + dy)) / 255.0;
         let (gx, gy) = ((l(1, 0) - l(-1, 0)) * 4.0, (l(0, 1) - l(0, -1)) * 4.0);
         let len = (gx * gx + gy * gy + 1.0).sqrt();
         let normal = [-gx / len, -gy / len, 1.0 / len];
         let diffuse = (normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]).max(0.0);
-        let p = image.get_pixel(x, y).0;
+        let p = get(image, x, y);
         let out = [0, 1, 2].map(|i| {
             let lit = 0.25 + k * diffuse * color[i] as f32 / 255.0 * 1.1;
-            to_u8(p[i] as f32 * lit)
+            p[i] * lit
         });
         [out[0], out[1], out[2], p[3]]
     })
@@ -1937,45 +2016,48 @@ fn lighting(image: &RgbaImage, angle: f32, intensity: f32, color: [u8; 3]) -> Rg
 
 // ---------------------------------------------------------------- other and camera
 
-fn offset(image: &RgbaImage, dx: i32, dy: i32, wrap: bool) -> RgbaImage {
+fn offset<S: Sample>(image: &Image<S>, dx: i32, dy: i32, wrap: bool) -> Image<S> {
     let (w, h) = (image.width() as i64, image.height() as i64);
     render(image.width(), image.height(), |x, y| {
         let (sx, sy) = (x as i64 - dx as i64, y as i64 - dy as i64);
         if wrap {
-            image
-                .get_pixel(sx.rem_euclid(w) as u32, sy.rem_euclid(h) as u32)
-                .0
+            get(image, sx.rem_euclid(w) as u32, sy.rem_euclid(h) as u32)
         } else if (0..w).contains(&sx) && (0..h).contains(&sy) {
-            image.get_pixel(sx as u32, sy as u32).0
+            get(image, sx as u32, sy as u32)
         } else {
-            [0; 4]
+            [0.0; 4]
         }
     })
 }
 
-fn vignette(image: &RgbaImage, amount: f32, midpoint: f32) -> RgbaImage {
+fn vignette<S: Sample>(image: &Image<S>, amount: f32, midpoint: f32) -> Image<S> {
     let (cx, cy) = at(image, (0.5, 0.5));
     let reach = half_diagonal(image);
     let start = midpoint.clamp(0.0, 100.0) / 100.0 * 0.8;
     let k = amount.clamp(-100.0, 100.0) / 100.0;
     render(image.width(), image.height(), |x, y| {
-        let p = image.get_pixel(x, y).0;
+        let p = get(image, x, y);
         let r = (x as f32 - cx).hypot(y as f32 - cy) / reach;
         let t = smoothstep(start, 1.0, r) * k;
         let c = [0, 1, 2].map(|i| {
-            let v = p[i] as f32;
-            to_u8(if t < 0.0 {
+            let v = p[i];
+            if t < 0.0 {
                 v * (1.0 + t)
             } else {
                 v + (255.0 - v) * t
-            })
+            }
         });
         [c[0], c[1], c[2], p[3]]
     })
 }
 
 /// Barrel/pincushion correction, per-channel scale for colour fringes, corner shading.
-fn lens_correction(image: &RgbaImage, distortion: f32, vignette: f32, chromatic: f32) -> RgbaImage {
+fn lens_correction<S: Sample>(
+    image: &Image<S>,
+    distortion: f32,
+    vignette: f32,
+    chromatic: f32,
+) -> Image<S> {
     let (cx, cy) = at(image, (0.5, 0.5));
     let reach = half_diagonal(image);
     let k = distortion / 100.0 * 0.3;
@@ -1989,18 +2071,18 @@ fn lens_correction(image: &RgbaImage, distortion: f32, vignette: f32, chromatic:
         let taps = scales.map(|s| sample(image, cx + dx * s, cy + dy * s));
         let alpha = taps[1][3];
         if alpha <= 0.001 {
-            return [0; 4];
+            return [0.0; 4];
         }
         let light = (1.0 + shade * r2).max(0.0);
-        let c = [0, 1, 2].map(|i| to_u8(taps[i][i] * 255.0 / taps[i][3].max(0.001) * light));
-        [c[0], c[1], c[2], to_u8(alpha)]
+        let c = [0, 1, 2].map(|i| taps[i][i] * 255.0 / taps[i][3].max(0.001) * light);
+        [c[0], c[1], c[2], alpha]
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Rgba;
+    use crate::{DeepImage, Rgba, RgbaImage};
 
     fn noisy(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_fn(w, h, |x, y| {
@@ -2097,5 +2179,58 @@ mod tests {
             let _ = filter.params();
         }
         assert_eq!(Filter::catalog().len(), 57);
+    }
+
+    #[test]
+    fn deep_filters_look_like_eight_bit_ones() {
+        let mut image = noisy(16, 12);
+        image.put_pixel(3, 3, Rgba([200, 40, 90, 0]));
+        image.put_pixel(4, 3, Rgba([20, 140, 30, 128]));
+        let deep = crate::depth::to_deep(&image);
+        // Hard decisions (luma thresholds, brightness bins, displacement by luma) flip on a
+        // fraction of a level, and on pure noise one flip moves a value a lot.
+        let decisions = [
+            "Smart Blur",
+            "Sharpen Edges",
+            "Dust & Scratches",
+            "Oil Paint",
+            "Displace",
+        ];
+        for (_, name, filter) in Filter::catalog() {
+            let eight = filter.apply(&image);
+            let from_deep = crate::depth::to_rgba8(&filter.apply(&deep));
+            assert_eq!(from_deep.dimensions(), eight.dimensions(), "{name}");
+            if decisions.contains(&name) {
+                continue;
+            }
+            let off = eight
+                .as_raw()
+                .iter()
+                .zip(from_deep.as_raw())
+                .filter(|(a, b)| a.abs_diff(**b) > 2)
+                .count();
+            assert_eq!(
+                off, 0,
+                "{name}: {off} channels differ by more than 2 levels"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_blurs_keep_bright_values() {
+        let flat = DeepImage::from_pixel(20, 10, Rgba([4.0, 0.5, 0.0, 1.0]));
+        for out in [
+            gaussian_blur(&flat, 3.0),
+            box_blur(&flat, 2),
+            Filter::GaussianBlur { radius: 50.0 }.apply(&flat),
+        ] {
+            for p in out.pixels() {
+                assert!(
+                    (p[0] - 4.0).abs() < 1e-3 && (p[1] - 0.5).abs() < 1e-3,
+                    "{p:?}"
+                );
+                assert!((p[3] - 1.0).abs() < 1e-4, "{p:?}");
+            }
+        }
     }
 }

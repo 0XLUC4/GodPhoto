@@ -6,6 +6,7 @@
 pub mod adjust;
 pub mod blend;
 pub mod color;
+pub mod depth;
 pub mod filter;
 pub mod io;
 pub mod paint;
@@ -18,6 +19,7 @@ pub mod vector;
 
 pub use adjust::Adjustment;
 pub use blend::Blend;
+pub use depth::{DeepImage, Depth, Image, Raster, Sample};
 pub use filter::Filter;
 pub use image::{GrayImage, Rgba, RgbaImage};
 pub use style::Effects;
@@ -704,23 +706,27 @@ fn draw_layer(
 }
 
 /// Multiply the alpha of `image` by `mask`.
-pub fn apply_mask(image: &mut RgbaImage, mask: &GrayImage) {
+pub fn apply_mask<S: Sample>(image: &mut Image<S>, mask: &GrayImage) {
     image
         .par_chunks_mut(4)
         .zip(mask.as_raw().par_iter())
-        .for_each(|(pixel, &m)| pixel[3] = mul(pixel[3], m));
+        .for_each(|(pixel, &m)| pixel[3] = S::from_unit(pixel[3].unit() * m as f32 / 255.0));
 }
 
-pub fn alpha_of(image: &RgbaImage) -> GrayImage {
-    let raw = image.pixels().map(|pixel| pixel[3]).collect();
+/// The alpha of `image`, at 8 bits.
+pub fn alpha_of<S: Sample>(image: &Image<S>) -> GrayImage {
+    let raw = image
+        .pixels()
+        .map(|pixel| u8::from_unit(pixel[3].unit()))
+        .collect();
     GrayImage::from_raw(image.width(), image.height(), raw).expect("same size")
 }
 
 /// Put `changed` over `out` where `mask` and `clip` let it, at `opacity`.
 /// Used for adjustments, and for a filter or fill cut to a selection.
-pub fn mix(
-    out: &mut RgbaImage,
-    changed: &RgbaImage,
+pub fn mix<S: Sample>(
+    out: &mut Image<S>,
+    changed: &Image<S>,
     opacity: f32,
     mask: Option<&GrayImage>,
     clip: Option<&GrayImage>,
@@ -742,8 +748,8 @@ pub fn mix(
                 return;
             }
             for channel in 0..4 {
-                let (a, b) = (pixel[channel] as f32, new[channel] as f32);
-                pixel[channel] = (a + (b - a) * amount).round() as u8;
+                let (a, b) = (pixel[channel].unit(), new[channel].unit());
+                pixel[channel] = S::from_unit(a + (b - a) * amount);
             }
         });
 }

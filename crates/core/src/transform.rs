@@ -5,7 +5,7 @@ use image::{GrayImage, ImageBuffer, Pixel, Rgba32FImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::RgbaImage;
+use crate::depth::{Image, Sample};
 
 /// How pixels are interpolated when scaled or moved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,38 +64,42 @@ impl Anchor {
 }
 
 /// Scale to `w` x `h`; colours are premultiplied around the kernel so transparent pixels don't bleed.
-pub fn resize(image: &RgbaImage, w: u32, h: u32, resample: Resample) -> RgbaImage {
+pub fn resize<S: Sample>(image: &Image<S>, w: u32, h: u32, resample: Resample) -> Image<S> {
     if w == 0 || h == 0 || image.width() == 0 || image.height() == 0 {
-        return RgbaImage::new(w, h);
+        return Image::<S>::new(w, h);
     }
     let mut premul = Rgba32FImage::new(image.width(), image.height());
     premul
         .par_chunks_mut(4)
         .zip(image.par_chunks(4))
         .for_each(|(out, p)| {
-            // Float images are 0..1 (the kernels clamp to it).
-            let a = p[3] as f32 / 255.0;
-            out.copy_from_slice(&[
-                p[0] as f32 / 255.0 * a,
-                p[1] as f32 / 255.0 * a,
-                p[2] as f32 / 255.0 * a,
-                a,
-            ]);
+            let a = p[3].unit().min(1.0);
+            out.copy_from_slice(&[p[0].unit() * a, p[1].unit() * a, p[2].unit() * a, a]);
         });
+    // The kernels clamp float images to 0..1: bright colours are scaled into it and back.
+    let bright = premul
+        .par_chunks(4)
+        .map(|p| p[0].max(p[1]).max(p[2]))
+        .reduce(|| 1.0, f32::max);
+    if bright > 1.0 {
+        premul.par_chunks_mut(4).for_each(|p| {
+            (0..3).for_each(|c| p[c] /= bright);
+        });
+    }
     let scaled = imageops::resize(&premul, w, h, resample.filter());
-    let mut out = RgbaImage::new(w, h);
+    let mut out = Image::<S>::new(w, h);
     out.par_chunks_mut(4)
         .zip(scaled.par_chunks(4))
         .for_each(|(p, s)| {
             let a = s[3].clamp(0.0, 1.0);
             if a <= 0.0 {
-                p.copy_from_slice(&[0; 4]);
+                p.fill(S::default());
                 return;
             }
             for c in 0..3 {
-                p[c] = (s[c] / a * 255.0).round().clamp(0.0, 255.0) as u8;
+                p[c] = S::from_unit(s[c] * bright / a);
             }
-            p[3] = (a * 255.0).round() as u8;
+            p[3] = S::from_unit(a);
         });
     out
 }
@@ -109,8 +113,14 @@ pub fn resize_gray(mask: &GrayImage, w: u32, h: u32) -> GrayImage {
 }
 
 /// New canvas size, the image placed by `anchor`, new area filled with `fill`.
-pub fn canvas(image: &RgbaImage, w: u32, h: u32, anchor: Anchor, fill: [u8; 4]) -> RgbaImage {
-    let mut out = RgbaImage::from_pixel(w, h, crate::Rgba(fill));
+pub fn canvas<S: Sample>(
+    image: &Image<S>,
+    w: u32,
+    h: u32,
+    anchor: Anchor,
+    fill: [u8; 4],
+) -> Image<S> {
+    let mut out = Image::<S>::from_pixel(w, h, px::<S>(fill));
     let (x, y) = anchor.offset((w, h), image.dimensions());
     imageops::replace(&mut out, image, x, y);
     out
@@ -125,7 +135,7 @@ pub fn canvas_gray(mask: &GrayImage, w: u32, h: u32, anchor: Anchor) -> GrayImag
 }
 
 /// The part (x, y, w, h), clipped to the image.
-pub fn crop(image: &RgbaImage, x: u32, y: u32, w: u32, h: u32) -> RgbaImage {
+pub fn crop<S: Sample>(image: &Image<S>, x: u32, y: u32, w: u32, h: u32) -> Image<S> {
     imageops::crop_imm(image, x, y, w, h).to_image()
 }
 
@@ -186,13 +196,19 @@ fn catmull_rom(t: f32) -> f32 {
 
 /// Colour at the continuous point (x, y) (pixel centres at +0.5), premultiplied across the kernel.
 /// Taps outside the image read `outside`.
-fn sample(image: &RgbaImage, x: f32, y: f32, resample: Resample, outside: [u8; 4]) -> [u8; 4] {
+fn sample<S: Sample>(
+    image: &Image<S>,
+    x: f32,
+    y: f32,
+    resample: Resample,
+    outside: S::Px,
+) -> S::Px {
     let (w, h) = (image.width() as i64, image.height() as i64);
     let fetch = |px: i64, py: i64| {
         if px < 0 || py < 0 || px >= w || py >= h {
             outside
         } else {
-            image.get_pixel(px as u32, py as u32).0
+            *image.get_pixel(px as u32, py as u32)
         }
     };
     let (kernel, radius): (fn(f32) -> f32, i64) = match resample {
@@ -216,25 +232,35 @@ fn sample(image: &RgbaImage, x: f32, y: f32, resample: Resample, outside: [u8; 4
                 continue;
             }
             let p = fetch(px, py);
-            let a = p[3] as f32 * weight;
-            acc[0] += p[0] as f32 * a;
-            acc[1] += p[1] as f32 * a;
-            acc[2] += p[2] as f32 * a;
+            let a = p[3].unit() * weight;
+            acc[0] += p[0].unit() * a;
+            acc[1] += p[1].unit() * a;
+            acc[2] += p[2].unit() * a;
             acc[3] += a;
             total += weight;
         }
     }
     if acc[3] <= 0.0 || total <= 0.0 {
-        return [0; 4];
+        return clear::<S>();
     }
-    let alpha = (acc[3] / total).clamp(0.0, 255.0);
-    let color = [0, 1, 2].map(|c| (acc[c] / acc[3]).round().clamp(0.0, 255.0) as u8);
-    [color[0], color[1], color[2], alpha.round() as u8]
+    let alpha = (acc[3] / total).clamp(0.0, 1.0);
+    let color = [0, 1, 2].map(|c| S::from_unit(acc[c] / acc[3]));
+    S::rgba([color[0], color[1], color[2], S::from_unit(alpha)])
+}
+
+/// A clear pixel.
+fn clear<S: Sample>() -> S::Px {
+    S::rgba([S::default(); 4])
+}
+
+/// An 8-bit colour as a pixel of depth `S`.
+fn px<S: Sample>(color: [u8; 4]) -> S::Px {
+    S::rgba(color.map(|v| S::from_unit(v.unit())))
 }
 
 /// Image of `w` x `h` where each pixel centre is looked up through `map` (None = transparent).
-fn remap(w: u32, h: u32, map: impl Fn(f32, f32) -> Option<[u8; 4]> + Sync) -> RgbaImage {
-    let mut out = RgbaImage::new(w, h);
+fn remap<S: Sample>(w: u32, h: u32, map: impl Fn(f32, f32) -> Option<S::Px> + Sync) -> Image<S> {
+    let mut out = Image::<S>::new(w, h);
     if w == 0 {
         return out;
     }
@@ -243,7 +269,7 @@ fn remap(w: u32, h: u32, map: impl Fn(f32, f32) -> Option<[u8; 4]> + Sync) -> Rg
         .for_each(|(y, row)| {
             for (x, p) in row.chunks_mut(4).enumerate() {
                 if let Some(color) = map(x as f32 + 0.5, y as f32 + 0.5) {
-                    p.copy_from_slice(&color);
+                    p.copy_from_slice(color.channels());
                 }
             }
         });
@@ -252,7 +278,8 @@ fn remap(w: u32, h: u32, map: impl Fn(f32, f32) -> Option<[u8; 4]> + Sync) -> Rg
 
 /// Turn by `degrees` (clockwise on screen) about the centre, bilinear. `expand` grows the
 /// canvas to hold the corners; new area is `fill`.
-pub fn rotate(image: &RgbaImage, degrees: f32, expand: bool, fill: [u8; 4]) -> RgbaImage {
+pub fn rotate<S: Sample>(image: &Image<S>, degrees: f32, expand: bool, fill: [u8; 4]) -> Image<S> {
+    let fill = px::<S>(fill);
     let (iw, ih) = (image.width() as f32, image.height() as f32);
     let (sin, cos) = degrees.to_radians().sin_cos();
     let (w, h) = if expand {
@@ -389,14 +416,14 @@ impl Affine {
 
 /// Move the image by `m` (source to destination) on the same canvas; outside is transparent.
 // shortcut: no prefiltering, so strong shrinking aliases; resize() first when that matters.
-pub fn affine(image: &RgbaImage, m: &Affine, resample: Resample) -> RgbaImage {
+pub fn affine<S: Sample>(image: &Image<S>, m: &Affine, resample: Resample) -> Image<S> {
     let (w, h) = image.dimensions();
     let Some(inverse) = m.invert() else {
-        return RgbaImage::new(w, h);
+        return Image::<S>::new(w, h);
     };
     remap(w, h, |x, y| {
         let (sx, sy) = inverse.apply(x, y);
-        Some(sample(image, sx, sy, resample, [0; 4]))
+        Some(sample(image, sx, sy, resample, clear::<S>()))
     })
 }
 
@@ -479,29 +506,34 @@ fn inside_rect((x, y, w, h): (f32, f32, f32, f32), px: f32, py: f32) -> bool {
 
 /// Distort the `source` rect (x, y, w, h) so its corners (TL TR BR BL) land on `corners`.
 /// Only that content is drawn; the rest is transparent.
-pub fn perspective(
-    image: &RgbaImage,
+pub fn perspective<S: Sample>(
+    image: &Image<S>,
     corners: [(f32, f32); 4],
     source: (f32, f32, f32, f32),
-) -> RgbaImage {
+) -> Image<S> {
     let (w, h) = image.dimensions();
     let Some(back) = homography(corners, rect_corners(source)) else {
-        return RgbaImage::new(w, h);
+        return Image::<S>::new(w, h);
     };
     remap(w, h, |x, y| {
         let (sx, sy) = project(&back, x, y)?;
-        inside_rect(source, sx, sy).then(|| sample(image, sx, sy, Resample::Bilinear, [0; 4]))
+        inside_rect(source, sx, sy).then(|| sample(image, sx, sy, Resample::Bilinear, clear::<S>()))
     })
 }
 
 /// Straighten the quad (TL TR BR BL) into a `w` x `h` image.
-pub fn perspective_crop(image: &RgbaImage, quad: [(f32, f32); 4], w: u32, h: u32) -> RgbaImage {
+pub fn perspective_crop<S: Sample>(
+    image: &Image<S>,
+    quad: [(f32, f32); 4],
+    w: u32,
+    h: u32,
+) -> Image<S> {
     let Some(map) = homography(rect_corners((0.0, 0.0, w as f32, h as f32)), quad) else {
-        return RgbaImage::new(w, h);
+        return Image::<S>::new(w, h);
     };
     remap(w, h, |x, y| {
         let (sx, sy) = project(&map, x, y)?;
-        Some(sample(image, sx, sy, Resample::Bilinear, [0; 4]))
+        Some(sample(image, sx, sy, Resample::Bilinear, clear::<S>()))
     })
 }
 
@@ -527,9 +559,13 @@ pub fn patch_point(grid: &[(f32, f32); 16], u: f32, v: f32) -> (f32, f32) {
 
 /// Warp the `source` rect by a bicubic Bezier patch (`grid`: 4x4 control points, row-major,
 /// the corners where the rect corners go). Only that content is drawn.
-pub fn warp(image: &RgbaImage, grid: &[(f32, f32); 16], source: (f32, f32, f32, f32)) -> RgbaImage {
+pub fn warp<S: Sample>(
+    image: &Image<S>,
+    grid: &[(f32, f32); 16],
+    source: (f32, f32, f32, f32),
+) -> Image<S> {
     let (w, h) = image.dimensions();
-    let mut out = RgbaImage::new(w, h);
+    let mut out = Image::<S>::new(w, h);
     // Inverse by a dense forward mesh: each small triangle is filled with interpolated (u, v).
     let extent = grid
         .iter()
@@ -550,7 +586,7 @@ pub fn warp(image: &RgbaImage, grid: &[(f32, f32); 16], source: (f32, f32, f32, 
                 fill_triangle(&mut out, pts, uvs, |u, v| {
                     let sx = source.0 + u * source.2;
                     let sy = source.1 + v * source.3;
-                    sample(image, sx, sy, Resample::Bilinear, [0; 4])
+                    sample(image, sx, sy, Resample::Bilinear, clear::<S>())
                 });
             }
         }
@@ -559,11 +595,11 @@ pub fn warp(image: &RgbaImage, grid: &[(f32, f32); 16], source: (f32, f32, f32, 
 }
 
 /// Set every pixel whose centre is in the triangle `pts` to `color(u, v)`, (u, v) interpolated.
-fn fill_triangle(
-    out: &mut RgbaImage,
+fn fill_triangle<S: Sample>(
+    out: &mut Image<S>,
     pts: [(f32, f32); 3],
     uvs: [(f32, f32); 3],
-    color: impl Fn(f32, f32) -> [u8; 4],
+    color: impl Fn(f32, f32) -> S::Px,
 ) {
     let [(x0, y0), (x1, y1), (x2, y2)] = pts;
     let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
@@ -587,22 +623,22 @@ fn fill_triangle(
             }
             let u = b0 * uvs[0].0 + b1 * uvs[1].0 + b2 * uvs[2].0;
             let v = b0 * uvs[0].1 + b1 * uvs[1].1 + b2 * uvs[2].1;
-            out.put_pixel(x, y, crate::Rgba(color(u, v)));
+            out.put_pixel(x, y, color(u, v));
         }
     }
 }
 
 /// Box (x, y, w, h) to keep: everything but transparent edges, or edges of the top-left colour.
-pub fn trim(image: &RgbaImage, by_transparency: bool) -> Option<(u32, u32, u32, u32)> {
+pub fn trim<S: Sample>(image: &Image<S>, by_transparency: bool) -> Option<(u32, u32, u32, u32)> {
     let (w, h) = image.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    let corner = image.get_pixel(0, 0).0;
+    let corner = *image.get_pixel(0, 0);
     let keep = crate::select::gray_from_fn(w, h, |x, y| {
-        let p = image.get_pixel(x, y).0;
+        let p = *image.get_pixel(x, y);
         let kept = if by_transparency {
-            p[3] > 0
+            p[3] > S::default()
         } else {
             p != corner
         };
@@ -612,8 +648,8 @@ pub fn trim(image: &RgbaImage, by_transparency: bool) -> Option<(u32, u32, u32, 
 }
 
 /// Move by (dx, dy) on the same canvas; uncovered area is transparent.
-pub fn shift(image: &RgbaImage, dx: i32, dy: i32) -> RgbaImage {
-    let mut out = RgbaImage::new(image.width(), image.height());
+pub fn shift<S: Sample>(image: &Image<S>, dx: i32, dy: i32) -> Image<S> {
+    let mut out = Image::<S>::new(image.width(), image.height());
     imageops::replace(&mut out, image, dx as i64, dy as i64);
     out
 }
@@ -621,7 +657,7 @@ pub fn shift(image: &RgbaImage, dx: i32, dy: i32) -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Rgba;
+    use crate::{Rgba, RgbaImage};
 
     fn checker(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_fn(w, h, |x, y| {
@@ -730,5 +766,29 @@ mod tests {
         let out = affine(&image, &Affine::translate(2.0, 1.0), Resample::Bicubic);
         assert_eq!(out.get_pixel(3, 2), image.get_pixel(1, 1));
         assert_eq!(shift(&image, 2, 1).get_pixel(3, 2), image.get_pixel(1, 1));
+    }
+    #[test]
+    fn deep_images_keep_bright_values() {
+        let flat = crate::DeepImage::from_pixel(13, 9, Rgba([3.0, 0.5, 0.0, 1.0]));
+        for resample in [Resample::Bilinear, Resample::Bicubic, Resample::Lanczos] {
+            let out = resize(&flat, 31, 4, resample);
+            assert!(
+                out.pixels()
+                    .all(|p| (p[0] - 3.0).abs() < 1e-3 && (p[1] - 0.5).abs() < 1e-3),
+                "{resample:?}"
+            );
+        }
+        let image = checker(6, 5);
+        let deep = crate::depth::to_deep(&image);
+        let m = Affine::identity();
+        let (eight, float) = (
+            affine(&image, &m, Resample::Bicubic),
+            affine(&deep, &m, Resample::Bicubic),
+        );
+        for (a, b) in eight.pixels().zip(float.pixels()) {
+            assert!((0..4).all(|c| (a[c] as f32 / 255.0 - b[c]).abs() <= 1.0 / 255.0));
+        }
+        let turned = rotate(&deep, 90.0, true, [0; 4]);
+        assert_eq!(turned.dimensions(), (5, 6));
     }
 }

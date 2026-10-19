@@ -1,11 +1,18 @@
 //! Colour adjustments (live as adjustment layers, or applied once) and auto corrections.
 //!
-//! Every function leaves alpha untouched. Channel-independent adjustments go through
-//! 256-entry tables; the rest run per pixel in parallel.
+//! Every function leaves alpha untouched and works at every depth ([`Image<S>`]). At 8 bits,
+//! channel-independent adjustments go through 256-entry tables; deeper images compute the
+//! same curves directly in floating point. Light above 1 is kept where the adjustment is
+//! defined on unbounded light (Exposure, Levels output, Brightness/Contrast, Channel Mixer,
+//! Photo Filter); colour-model maths (HSL, CMYK inks, 3D tables) reads values clamped to 0..1.
+
+use std::any::Any;
+use std::borrow::Cow;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::depth::{Image, Sample};
 use crate::filter::Param;
 use crate::{Error, Result, RgbaImage, luma};
 
@@ -43,6 +50,18 @@ impl Levels {
             let t = ((v as f32 - low) / span).clamp(0.0, 1.0).powf(inv_gamma);
             (out_low + t * (out_high - out_low)).round() as u8
         })
+    }
+
+    /// One value (0..1, or above 1 for very bright light) through these levels, unrounded.
+    /// Light above 1 continues the curve proportionally, so the output can exceed `out_white`.
+    pub fn curve(&self, v: f32) -> f32 {
+        let low = self.in_black as f32 / 255.0;
+        let span = ((self.in_white as f32 - self.in_black as f32) / 255.0).max(1.0 / 255.0);
+        let inv_gamma = 1.0 / self.gamma.clamp(0.01, 10.0);
+        let t = |v: f32| ((v - low) / span).clamp(0.0, 1.0).powf(inv_gamma);
+        let t = if v > 1.0 { t(1.0) * v } else { t(v) };
+        let (out_low, out_high) = (self.out_black as f32 / 255.0, self.out_white as f32 / 255.0);
+        out_low + t * (out_high - out_low)
     }
 }
 
@@ -247,31 +266,48 @@ impl Adjustment {
         Self::KINDS[index]
     }
 
-    /// Change the colours of `image` in place; alpha is untouched.
-    pub fn apply(&self, image: &mut RgbaImage) {
+    /// Change the colours of `image` (any depth) in place; alpha is untouched.
+    /// Curves flatten beyond their end points, except light above 1, which scales the last
+    /// point's value proportionally.
+    pub fn apply<S: Sample>(&self, image: &mut Image<S>) {
         match self {
             Self::BrightnessContrast {
                 brightness,
                 contrast,
-            } => apply_luts(image, &[brightness_contrast_lut(*brightness, *contrast); 3]),
-            Self::Levels { channels } => {
-                let master = channels[0].lut();
-                let luts =
-                    std::array::from_fn(|c| channels[c + 1].lut().map(|v| master[v as usize]));
-                apply_luts(image, &luts);
+            } => {
+                let curve = brightness_contrast(*brightness, *contrast);
+                apply_curves(image, || [table(&curve); 3], |_, t| curve(t));
             }
+            Self::Levels { channels } => apply_curves(
+                image,
+                || {
+                    let master = channels[0].lut();
+                    std::array::from_fn(|c| channels[c + 1].lut().map(|v| master[v as usize]))
+                },
+                |c, t| channels[0].curve(channels[c + 1].curve(t)),
+            ),
             Self::Curves { channels } => {
-                let master = curve_lut(&channels[0]);
-                let luts = std::array::from_fn(|c| {
-                    curve_lut(&channels[c + 1]).map(|v| master[v as usize])
-                });
-                apply_luts(image, &luts);
+                let master = curve_fn(&channels[0]);
+                let each = [1, 2, 3].map(|c| curve_fn(&channels[c]));
+                apply_curves(
+                    image,
+                    || {
+                        let master = curve_lut(&channels[0]);
+                        std::array::from_fn(|c| {
+                            curve_lut(&channels[c + 1]).map(|v| master[v as usize])
+                        })
+                    },
+                    |c, t| master(each[c](t * 255.0)) / 255.0,
+                );
             }
             Self::Exposure {
                 exposure,
                 offset,
                 gamma,
-            } => apply_luts(image, &[exposure_lut(*exposure, *offset, *gamma); 3]),
+            } => {
+                let curve = exposure_curve(*exposure, *offset, *gamma);
+                apply_curves(image, || [table(&curve); 3], |_, t| curve(t));
+            }
             Self::Vibrance {
                 vibrance,
                 saturation,
@@ -300,13 +336,22 @@ impl Adjustment {
             } => color_balance(image, [shadows, midtones, highlights], *preserve_luminosity),
             Self::BlackWhite { weights, tint } => {
                 let tint = tint.map(|t| rgb_to_hsl(t.map(unit)));
-                map_rgb(image, |c| {
-                    let grey = black_white(c, weights);
-                    match tint {
-                        Some([h, s, _]) => hsl_to_rgb([h, s, unit(grey)]).map(byte),
-                        None => [grey; 3],
-                    }
-                });
+                match eight_mut(image) {
+                    Some(image) => map_rgb(image, |c| {
+                        let grey = black_white(c, weights);
+                        match tint {
+                            Some([h, s, _]) => hsl_to_rgb([h, s, unit(grey)]).map(byte),
+                            None => [grey; 3],
+                        }
+                    }),
+                    None => map_unit(image, |c| {
+                        let grey = black_white_grey(c, weights);
+                        match tint {
+                            Some([h, s, _]) => hsl_to_rgb([h, s, grey.clamp(0.0, 1.0)]),
+                            None => [grey; 3],
+                        }
+                    }),
+                }
             }
             Self::PhotoFilter {
                 color,
@@ -331,25 +376,55 @@ impl Adjustment {
                     rows.map(|row| (c[0] * row[0] + c[1] * row[1] + c[2] * row[2] + row[3]) / 100.0)
                 });
             }
-            Self::Invert => apply_luts(image, &[std::array::from_fn(|v| 255 - v as u8); 3]),
+            Self::Invert => apply_curves(
+                image,
+                || [std::array::from_fn(|v| 255 - v as u8); 3],
+                |_, t| 1.0 - t.min(1.0),
+            ),
             Self::Posterize { levels } => {
                 let steps = (*levels).max(2) as f32 - 1.0;
-                let lut = std::array::from_fn(|v| {
-                    ((v as f32 / 255.0 * steps).round() / steps * 255.0).round() as u8
-                });
-                apply_luts(image, &[lut; 3]);
+                apply_curves(
+                    image,
+                    || {
+                        [std::array::from_fn(|v| {
+                            ((v as f32 / 255.0 * steps).round() / steps * 255.0).round() as u8
+                        }); 3]
+                    },
+                    |_, t| (t.clamp(0.0, 1.0) * steps).round() / steps,
+                );
             }
-            Self::Threshold { level } => map_rgb(image, |[r, g, b]| {
-                [if luma(r, g, b) >= *level { 255 } else { 0 }; 3]
-            }),
+            Self::Threshold { level } => match eight_mut(image) {
+                Some(image) => map_rgb(image, |[r, g, b]| {
+                    [if luma(r, g, b) >= *level { 255 } else { 0 }; 3]
+                }),
+                // Same rounding as the 8-bit luma.
+                None => map_unit(image, |c| {
+                    [if luma_unit(c) * 255.0 + 0.5 >= *level as f32 {
+                        1.0
+                    } else {
+                        0.0
+                    }; 3]
+                }),
+            },
             Self::GradientMap { stops, reverse } => {
-                if let Some(lut) = gradient_lut(stops, *reverse) {
-                    map_rgb(image, |[r, g, b]| lut[luma(r, g, b) as usize]);
+                let Some(gradient) = gradient_fn(stops, *reverse) else {
+                    return;
+                };
+                match eight_mut(image) {
+                    Some(image) => {
+                        let lut: [[u8; 3]; 256] = std::array::from_fn(|v| {
+                            gradient(v as f32 / 255.0).map(|x| x.round() as u8)
+                        });
+                        map_rgb(image, |[r, g, b]| lut[luma(r, g, b) as usize]);
+                    }
+                    None => map_unit(image, |c| {
+                        gradient(luma_unit(c).clamp(0.0, 1.0)).map(|x| x / 255.0)
+                    }),
                 }
             }
             Self::SelectiveColor { ranges, absolute } => {
                 if ranges.iter().flatten().any(|&v| v != 0.0) {
-                    map_rgb(image, |c| selective_color(c, ranges, *absolute));
+                    map_unit(image, |c| selective_color(c, ranges, *absolute));
                 }
             }
             Self::ColorLookup { size, table, .. } => color_lookup(image, *size, table),
@@ -519,16 +594,23 @@ pub fn parse_cube(name: &str, text: &str) -> Result<Adjustment> {
 }
 
 /// Grey from each pixel's HSL lightness.
-pub fn desaturate(image: &mut RgbaImage) {
-    map_rgb(image, |[r, g, b]| {
-        let (max, min) = (r.max(g).max(b) as u16, r.min(g).min(b) as u16);
-        [(max + min).div_ceil(2) as u8; 3]
-    });
+pub fn desaturate<S: Sample>(image: &mut Image<S>) {
+    match eight_mut(image) {
+        Some(image) => map_rgb(image, |[r, g, b]| {
+            let (max, min) = (r.max(g).max(b) as u16, r.min(g).min(b) as u16);
+            [(max + min).div_ceil(2) as u8; 3]
+        }),
+        None => map_unit(image, |[r, g, b]| {
+            [(r.max(g).max(b) + r.min(g).min(b)) / 2.0; 3]
+        }),
+    }
 }
 
 /// Spread the brightness values evenly (one table for all channels, so hues stay).
-pub fn equalize(image: &mut RgbaImage) {
-    let hist = histogram(image);
+/// The counts come from the 8-bit view; deeper images follow the table smoothly between steps
+/// (light above 1 becomes white).
+pub fn equalize<S: Sample>(image: &mut Image<S>) {
+    let hist = histogram(&eight_view(image));
     let mut cdf = [0u64; 256];
     let mut total = 0u64;
     for v in 0..256 {
@@ -543,32 +625,33 @@ pub fn equalize(image: &mut RgbaImage) {
     }
     let span = (total - first) as f64;
     let lut = cdf.map(|count| (count.saturating_sub(first) as f64 / span * 255.0).round() as u8);
-    apply_luts(image, &[lut; 3]);
+    apply_curves(image, || [lut; 3], |_, t| lerp_table(&lut, t));
 }
 
-/// Stretch each channel on its own, clipping 0.1% at both ends.
-pub fn auto_tone(image: &mut RgbaImage) {
-    let hist = histogram(image);
-    let luts = std::array::from_fn(|c| {
+/// Stretch each channel on its own, clipping 0.1% at both ends (bounds read on the 8-bit view).
+pub fn auto_tone<S: Sample>(image: &mut Image<S>) {
+    let hist = histogram(&eight_view(image));
+    let levels: [Levels; 3] = std::array::from_fn(|c| {
         let (low, high) = clip_bounds(&hist[c]);
-        stretch_lut(low, high)
+        stretch(low, high)
     });
-    apply_luts(image, &luts);
+    apply_curves(image, || levels.map(|l| l.lut()), |c, t| levels[c].curve(t));
 }
 
 /// Stretch all channels by the same amount, so hues stay.
-pub fn auto_contrast(image: &mut RgbaImage) {
-    let hist = histogram(image);
+pub fn auto_contrast<S: Sample>(image: &mut Image<S>) {
+    let hist = histogram(&eight_view(image));
     let bounds = [0, 1, 2].map(|c| clip_bounds(&hist[c]));
     let low = bounds.iter().map(|b| b.0).min().unwrap_or(0);
     let high = bounds.iter().map(|b| b.1).max().unwrap_or(255);
-    apply_luts(image, &[stretch_lut(low, high); 3]);
+    let levels = stretch(low, high);
+    apply_curves(image, || [levels.lut(); 3], |_, t| levels.curve(t));
 }
 
 /// Auto tone, then pull the midtones' average to neutral grey.
-pub fn auto_color(image: &mut RgbaImage) {
+pub fn auto_color<S: Sample>(image: &mut Image<S>) {
     auto_tone(image);
-    let (sum, count) = image
+    let (sum, count) = eight_view(image)
         .as_raw()
         .par_chunks(4)
         .filter(|p| p[3] > 0 && (64..=192).contains(&luma(p[0], p[1], p[2])))
@@ -587,28 +670,30 @@ pub fn auto_color(image: &mut RgbaImage) {
     }
     let means = sum.map(|s| (s / count as f64 / 255.0).clamp(0.02, 0.98) as f32);
     let target = (means[0] + means[1] + means[2]) / 3.0;
-    let luts = std::array::from_fn(|c| {
-        // Power curve taking this channel's midtone mean to the common target.
-        let power = (target.ln() / means[c].ln()).clamp(0.5, 2.0);
-        std::array::from_fn(|v| byte(unit(v as u8).powf(power)))
-    });
-    apply_luts(image, &luts);
+    // Power curve taking each channel's midtone mean to the common target.
+    let powers = means.map(|mean| (target.ln() / mean.ln()).clamp(0.5, 2.0));
+    apply_curves(
+        image,
+        || powers.map(|power| std::array::from_fn(|v| byte(unit(v as u8).powf(power)))),
+        |c, t| t.powf(powers[c]),
+    );
 }
 
 /// Lift shadows and pull down highlights by local brightness (blurred over `radius` px).
-/// `shadows` and `highlights` are 0..100.
-pub fn shadows_highlights(image: &mut RgbaImage, shadows: f32, highlights: f32, radius: f32) {
+/// `shadows` and `highlights` are 0..100. Light above 1 is left as it is.
+pub fn shadows_highlights<S: Sample>(
+    image: &mut Image<S>,
+    shadows: f32,
+    highlights: f32,
+    radius: f32,
+) {
     let lift = (shadows / 100.0).clamp(0.0, 1.0);
     let pull = (highlights / 100.0).clamp(0.0, 1.0);
     let (width, height) = (image.width() as usize, image.height() as usize);
     if (lift == 0.0 && pull == 0.0) || width == 0 || height == 0 {
         return;
     }
-    let mut local: Vec<f32> = image
-        .as_raw()
-        .par_chunks(4)
-        .map(|p| luma(p[0], p[1], p[2]) as f32 / 255.0)
-        .collect();
+    let mut local = luma_plane(image);
     blur_plane(&mut local, width, height, radius);
     image
         .par_chunks_mut(4)
@@ -617,16 +702,20 @@ pub fn shadows_highlights(image: &mut RgbaImage, shadows: f32, highlights: f32, 
             let shadow_gamma = 1.0 / (1.0 + 2.0 * lift * smoothstep(0.6, 0.0, around));
             let highlight_gamma = 1.0 / (1.0 + 2.0 * pull * smoothstep(0.4, 1.0, around));
             for v in &mut pixel[..3] {
-                let t = unit(*v).powf(shadow_gamma);
-                *v = byte(1.0 - (1.0 - t).powf(highlight_gamma));
+                let t = v.unit();
+                if t > 1.0 {
+                    continue;
+                }
+                let t = t.powf(shadow_gamma);
+                *v = S::from_unit(1.0 - (1.0 - t).powf(highlight_gamma));
             }
         });
 }
 
 /// Shift hue, saturation and lightness of the colours near `from`.
 /// `fuzziness` is the RGB distance (0..~441) at which the effect fades out.
-pub fn replace_color(
-    image: &mut RgbaImage,
+pub fn replace_color<S: Sample>(
+    image: &mut Image<S>,
     from: [u8; 3],
     fuzziness: f32,
     hue: f32,
@@ -649,38 +738,48 @@ pub fn replace_color(
     });
 }
 
-/// Give `image` the per-channel mean and spread of `reference`; `intensity` 0..100.
-pub fn match_color(image: &mut RgbaImage, reference: &RgbaImage, intensity: f32) {
-    let (Some((mean, spread)), Some((ref_mean, ref_spread))) =
-        (channel_stats(image), channel_stats(reference))
-    else {
+/// Give `image` the per-channel mean and spread of `reference` (either at any depth; the
+/// statistics are read on their 8-bit views); `intensity` 0..100.
+pub fn match_color<S: Sample, R: Sample>(
+    image: &mut Image<S>,
+    reference: &Image<R>,
+    intensity: f32,
+) {
+    let (Some((mean, spread)), Some((ref_mean, ref_spread))) = (
+        channel_stats(&eight_view(image)),
+        channel_stats(&eight_view(reference)),
+    ) else {
         return;
     };
     let amount = (intensity / 100.0).clamp(0.0, 1.0);
-    let luts = std::array::from_fn(|c| {
-        let gain = ref_spread[c] / spread[c].max(1.0);
-        std::array::from_fn(|v| {
-            let v = v as f32;
-            let matched = (v - mean[c]) * gain + ref_mean[c];
-            (v + (matched - v) * amount).round().clamp(0.0, 255.0) as u8
-        })
-    });
-    apply_luts(image, &luts);
+    let gains: [f32; 3] = std::array::from_fn(|c| ref_spread[c] / spread[c].max(1.0));
+    let matched = |c: usize, v: f32| {
+        let target = (v - mean[c]) * gains[c] + ref_mean[c];
+        v + (target - v) * amount
+    };
+    apply_curves(
+        image,
+        || {
+            std::array::from_fn(|c| {
+                std::array::from_fn(|v| matched(c, v as f32).round().clamp(0.0, 255.0) as u8)
+            })
+        },
+        |c, t| matched(c, t * 255.0) / 255.0,
+    );
 }
 
 /// Local tone mapping: compress the large-scale brightness range by `strength` (0..100)
 /// and boost fine detail by `detail` (0..100), keeping colours.
-pub fn hdr_toning(image: &mut RgbaImage, strength: f32, detail: f32) {
+pub fn hdr_toning<S: Sample>(image: &mut Image<S>, strength: f32, detail: f32) {
     let (width, height) = (image.width() as usize, image.height() as usize);
     if width == 0 || height == 0 {
         return;
     }
     let compress = 1.0 - 0.75 * (strength / 100.0).clamp(0.0, 1.0);
     let boost = 1.0 + 2.0 * (detail / 100.0).clamp(0.0, 1.0);
-    let log: Vec<f32> = image
-        .as_raw()
-        .par_chunks(4)
-        .map(|p| (luma(p[0], p[1], p[2]) as f32 / 255.0 + 1.0 / 255.0).log2())
+    let log: Vec<f32> = luma_plane(image)
+        .into_par_iter()
+        .map(|y| (y + 1.0 / 255.0).log2())
         .collect();
     let mut base = log.clone();
     blur_plane(
@@ -697,7 +796,7 @@ pub fn hdr_toning(image: &mut RgbaImage, strength: f32, detail: f32) {
             let toned = mean + (around - mean) * compress + (own - around) * boost;
             let gain = (toned - own).exp2();
             for v in &mut pixel[..3] {
-                *v = byte(unit(*v) * gain);
+                *v = S::from_unit(v.unit() * gain);
             }
         });
 }
@@ -796,8 +895,46 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+fn clamp_unit(c: [f32; 3]) -> [f32; 3] {
+    c.map(|v| v.clamp(0.0, 1.0))
+}
+
+/// The 8-bit image behind `image`, for the 256-entry table fast paths.
+pub(crate) fn eight_mut<S: Sample>(image: &mut Image<S>) -> Option<&mut RgbaImage> {
+    (image as &mut dyn Any).downcast_mut()
+}
+
+/// The 8-bit image behind `image`, if it is one.
+pub(crate) fn eight_ref<S: Sample>(image: &Image<S>) -> Option<&RgbaImage> {
+    (image as &dyn Any).downcast_ref()
+}
+
+/// `image` at 8 bits: itself when it already is, else a clamped copy.
+pub(crate) fn eight_view<S: Sample>(image: &Image<S>) -> Cow<'_, RgbaImage> {
+    match eight_ref(image) {
+        Some(eight) => Cow::Borrowed(eight),
+        None => Cow::Owned(crate::depth::convert(image)),
+    }
+}
+
+/// Luminosity (0..1, above 1 for very bright light) of every pixel.
+fn luma_plane<S: Sample>(image: &Image<S>) -> Vec<f32> {
+    match eight_ref(image) {
+        Some(eight) => eight
+            .as_raw()
+            .par_chunks(4)
+            .map(|p| luma(p[0], p[1], p[2]) as f32 / 255.0)
+            .collect(),
+        None => image
+            .as_raw()
+            .par_chunks(4)
+            .map(|p| luma_unit([p[0].unit(), p[1].unit(), p[2].unit()]))
+            .collect(),
+    }
+}
+
 /// Run `f` on the RGB of every pixel, in parallel.
-fn map_rgb(image: &mut RgbaImage, f: impl Fn([u8; 3]) -> [u8; 3] + Sync) {
+fn map_rgb<S: Sample>(image: &mut Image<S>, f: impl Fn([S; 3]) -> [S; 3] + Sync) {
     image.par_chunks_mut(4 * 1024).for_each(|chunk| {
         for p in chunk.chunks_exact_mut(4) {
             let out = f([p[0], p[1], p[2]]);
@@ -806,27 +943,51 @@ fn map_rgb(image: &mut RgbaImage, f: impl Fn([u8; 3]) -> [u8; 3] + Sync) {
     });
 }
 
-/// Like [`map_rgb`] with channels as 0..1 floats (results are clamped).
-fn map_unit(image: &mut RgbaImage, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
-    map_rgb(image, |c| f(c.map(unit)).map(byte));
+/// Like [`map_rgb`] with channels as floats (0..1 at 8 bits; results stored with
+/// [`Sample::from_unit`], so clamped at 8 bits and kept above 1 deeper).
+fn map_unit<S: Sample>(image: &mut Image<S>, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
+    map_rgb(image, |c| f(c.map(S::unit)).map(S::from_unit));
 }
 
 fn apply_luts(image: &mut RgbaImage, luts: &[[u8; 256]; 3]) {
     map_rgb(image, |c| std::array::from_fn(|i| luts[i][c[i] as usize]));
 }
 
+/// Each channel through its curve: the 256-entry `tables` at 8 bits, else
+/// `curve(channel, value)` computed directly.
+fn apply_curves<S: Sample>(
+    image: &mut Image<S>,
+    tables: impl FnOnce() -> [[u8; 256]; 3],
+    curve: impl Fn(usize, f32) -> f32 + Sync,
+) {
+    match eight_mut(image) {
+        Some(image) => apply_luts(image, &tables()),
+        None => map_unit(image, |c| std::array::from_fn(|i| curve(i, c[i]))),
+    }
+}
+
 // ---- tables ----
 
-fn brightness_contrast_lut(brightness: f32, contrast: f32) -> [u8; 256] {
+/// The 8-bit table of a 0..1 curve.
+fn table(curve: impl Fn(f32) -> f32) -> [u8; 256] {
+    std::array::from_fn(|v| byte(curve(unit(v as u8))))
+}
+
+/// A 0..1 value through a 256-entry table, linear between its steps (above 1 reads as 1).
+fn lerp_table(table: &[u8; 256], t: f32) -> f32 {
+    let x = (t * 255.0).clamp(0.0, 255.0);
+    let i = (x as usize).min(254);
+    let (a, b) = (table[i] as f32, table[i + 1] as f32);
+    (a + (b - a) * (x - i as f32)) / 255.0
+}
+
+fn brightness_contrast(brightness: f32, contrast: f32) -> impl Fn(f32) -> f32 + Sync {
     let b = brightness / 100.0;
     // Brightness bends the midtones and keeps black and white where they are.
     let gamma = if b >= 0.0 { 1.0 / (1.0 + b) } else { 1.0 - b };
     let c = contrast / 100.0;
     let slope = if c >= 0.0 { 1.0 + 2.0 * c } else { 1.0 + c };
-    std::array::from_fn(|v| {
-        let t = unit(v as u8).powf(gamma);
-        byte((t - 0.5) * slope + 0.5)
-    })
+    move |t: f32| (t.powf(gamma) - 0.5) * slope + 0.5
 }
 
 fn srgb_to_linear(t: f32) -> f32 {
@@ -845,17 +1006,25 @@ fn linear_to_srgb(t: f32) -> f32 {
     }
 }
 
-fn exposure_lut(exposure: f32, offset: f32, gamma: f32) -> [u8; 256] {
+fn exposure_curve(exposure: f32, offset: f32, gamma: f32) -> impl Fn(f32) -> f32 + Sync {
     let gain = exposure.exp2();
     let inv_gamma = 1.0 / gamma.max(0.01);
-    std::array::from_fn(|v| {
-        let linear = (srgb_to_linear(unit(v as u8)) * gain + offset).max(0.0);
-        byte(linear_to_srgb(linear.powf(inv_gamma)))
-    })
+    move |t: f32| {
+        let linear = (srgb_to_linear(t) * gain + offset).max(0.0);
+        linear_to_srgb(linear.powf(inv_gamma))
+    }
 }
 
-/// Monotone cubic (Fritsch-Carlson) through the points; flat beyond the ends.
+/// The 8-bit table of [`curve_fn`].
 fn curve_lut(points: &[(u8, u8)]) -> [u8; 256] {
+    let curve = curve_fn(points);
+    std::array::from_fn(|v| curve(v as f32).round().clamp(0.0, 255.0) as u8)
+}
+
+/// Monotone cubic (Fritsch-Carlson) through the points, on 0..255 values, unrounded; flat
+/// beyond the ends, except above 255 where the last value scales with the input.
+/// Fewer than two points: identity.
+fn curve_fn(points: &[(u8, u8)]) -> impl Fn(f32) -> f32 + Sync {
     let mut points = points.to_vec();
     points.sort_by_key(|p| p.0);
     // Same x twice: the later point wins.
@@ -866,46 +1035,46 @@ fn curve_lut(points: &[(u8, u8)]) -> [u8; 256] {
         }
         same
     });
-    if points.len() < 2 {
-        return std::array::from_fn(|v| v as u8);
-    }
     let xs: Vec<f32> = points.iter().map(|p| p.0 as f32).collect();
     let ys: Vec<f32> = points.iter().map(|p| p.1 as f32).collect();
     let n = points.len();
-    let secants: Vec<f32> = (0..n - 1)
-        .map(|k| (ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k]))
-        .collect();
     let mut tangents = vec![0.0f32; n];
-    tangents[0] = secants[0];
-    tangents[n - 1] = secants[n - 2];
-    for k in 1..n - 1 {
-        let (before, after) = (secants[k - 1], secants[k]);
-        tangents[k] = if before * after <= 0.0 {
-            0.0
-        } else {
-            (before + after) / 2.0
-        };
-    }
-    for (k, &secant) in secants.iter().enumerate() {
-        if secant == 0.0 {
-            tangents[k] = 0.0;
-            tangents[k + 1] = 0.0;
-            continue;
+    if n >= 2 {
+        let secants: Vec<f32> = (0..n - 1)
+            .map(|k| (ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k]))
+            .collect();
+        tangents[0] = secants[0];
+        tangents[n - 1] = secants[n - 2];
+        for k in 1..n - 1 {
+            let (before, after) = (secants[k - 1], secants[k]);
+            tangents[k] = if before * after <= 0.0 {
+                0.0
+            } else {
+                (before + after) / 2.0
+            };
         }
-        let (a, b) = (tangents[k] / secant, tangents[k + 1] / secant);
-        let length = a * a + b * b;
-        if length > 9.0 {
-            let t = 3.0 / length.sqrt();
-            tangents[k] = t * a * secant;
-            tangents[k + 1] = t * b * secant;
+        for (k, &secant) in secants.iter().enumerate() {
+            if secant == 0.0 {
+                tangents[k] = 0.0;
+                tangents[k + 1] = 0.0;
+                continue;
+            }
+            let (a, b) = (tangents[k] / secant, tangents[k + 1] / secant);
+            let length = a * a + b * b;
+            if length > 9.0 {
+                let t = 3.0 / length.sqrt();
+                tangents[k] = t * a * secant;
+                tangents[k + 1] = t * b * secant;
+            }
         }
     }
-    std::array::from_fn(|v| {
-        let x = v as f32;
-        let y = if x <= xs[0] {
+    move |x: f32| {
+        if n < 2 {
+            x
+        } else if x <= xs[0] {
             ys[0]
         } else if x >= xs[n - 1] {
-            ys[n - 1]
+            ys[n - 1] * (x / 255.0).max(1.0)
         } else {
             let k = xs.partition_point(|&p| p <= x) - 1;
             let h = xs[k + 1] - xs[k];
@@ -915,31 +1084,30 @@ fn curve_lut(points: &[(u8, u8)]) -> [u8; 256] {
                 + (t3 - 2.0 * t2 + t) * h * tangents[k]
                 + (-2.0 * t3 + 3.0 * t2) * ys[k + 1]
                 + (t3 - t2) * h * tangents[k + 1]
-        };
-        y.round().clamp(0.0, 255.0) as u8
-    })
+        }
+    }
 }
 
-fn gradient_lut(stops: &[(f32, [u8; 3])], reverse: bool) -> Option<[[u8; 3]; 256]> {
+/// Colour (0..255 channels, unrounded) at luminosity `t` (0..1) of a gradient map.
+fn gradient_fn(stops: &[(f32, [u8; 3])], reverse: bool) -> Option<impl Fn(f32) -> [f32; 3] + Sync> {
     if stops.is_empty() {
         return None;
     }
     let mut stops = stops.to_vec();
     stops.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Some(std::array::from_fn(|v| {
-        let t = v as f32 / 255.0;
+    Some(move |t: f32| {
         let t = if reverse { 1.0 - t } else { t };
         let next = stops.partition_point(|s| s.0 <= t);
         if next == 0 {
-            return stops[0].1;
+            return stops[0].1.map(|v| v as f32);
         }
         if next == stops.len() {
-            return stops[next - 1].1;
+            return stops[next - 1].1.map(|v| v as f32);
         }
         let (a, b) = (stops[next - 1], stops[next]);
         let f = (t - a.0) / (b.0 - a.0).max(1e-6);
-        std::array::from_fn(|i| (a.1[i] as f32 + (b.1[i] as f32 - a.1[i] as f32) * f).round() as u8)
-    }))
+        std::array::from_fn(|i| a.1[i] as f32 + (b.1[i] as f32 - a.1[i] as f32) * f)
+    })
 }
 
 fn identity_table(size: usize) -> Vec<[f32; 3]> {
@@ -955,9 +1123,9 @@ fn identity_table(size: usize) -> Vec<[f32; 3]> {
 // ---- per-pixel colour maths ----
 
 /// Channels sorted brightest first, as indices 0 = R, 1 = G, 2 = B.
-fn order(c: [u8; 3]) -> [usize; 3] {
+fn order(c: [f32; 3]) -> [usize; 3] {
     let mut index = [0, 1, 2];
-    index.sort_by_key(|&i| std::cmp::Reverse(c[i]));
+    index.sort_by(|&a, &b| c[b].total_cmp(&c[a]));
     index
 }
 
@@ -974,6 +1142,7 @@ fn sectors(top: usize, second: usize) -> (usize, usize) {
 }
 
 fn vibrance_pixel(c: [f32; 3], vibrance: f32, saturation: f32) -> [f32; 3] {
+    let c = clamp_unit(c);
     let y = luma_unit(c);
     let max = c[0].max(c[1]).max(c[2]);
     let chroma = max - c[0].min(c[1]).min(c[2]);
@@ -1025,6 +1194,7 @@ fn hue_saturation(
     lightness: f32,
     colorize: bool,
 ) -> [f32; 3] {
+    let c = clamp_unit(c);
     let (sat, light) = (saturation / 100.0, lightness / 100.0);
     if colorize {
         // Saturation -100..100 maps to 0..1 (0 = half saturated).
@@ -1045,50 +1215,73 @@ fn hue_saturation(
         .map(|v| shift_lightness(v, light))
 }
 
-fn color_balance(image: &mut RgbaImage, ranges: [&[f32; 3]; 3], preserve: bool) {
+fn color_balance<S: Sample>(image: &mut Image<S>, ranges: [&[f32; 3]; 3], preserve: bool) {
     if ranges.iter().all(|range| range.iter().all(|&v| v == 0.0)) {
         return;
     }
     let [shadows, midtones, highlights] = ranges;
     // Tonal weights overlap smoothly; the 0.7 keeps a full slider from clipping at once.
     let (a, b, scale) = (0.25, 0.333, 0.7);
-    let luts: [[u8; 256]; 3] = std::array::from_fn(|c| {
-        std::array::from_fn(|v| {
-            let t = unit(v as u8);
-            let low = ((t - b) / -a + 0.5).clamp(0.0, 1.0) * scale;
-            let mid = ((t - b) / a + 0.5).clamp(0.0, 1.0)
-                * ((t + b - 1.0) / -a + 0.5).clamp(0.0, 1.0)
-                * scale;
-            let high = ((t + b - 1.0) / a + 0.5).clamp(0.0, 1.0) * scale;
-            byte(t + (shadows[c] * low + midtones[c] * mid + highlights[c] * high) / 100.0)
-        })
-    });
-    map_rgb(image, |c| {
-        let out = std::array::from_fn(|i| luts[i][c[i] as usize]);
-        if !preserve {
-            return out;
+    let shift = |c: usize, t: f32| {
+        let low = ((t - b) / -a + 0.5).clamp(0.0, 1.0) * scale;
+        let mid = ((t - b) / a + 0.5).clamp(0.0, 1.0)
+            * ((t + b - 1.0) / -a + 0.5).clamp(0.0, 1.0)
+            * scale;
+        let high = ((t + b - 1.0) / a + 0.5).clamp(0.0, 1.0) * scale;
+        (shadows[c] * low + midtones[c] * mid + highlights[c] * high) / 100.0
+    };
+    // The hue and saturation of `out` with the lightness of `before`.
+    let keep_lightness = |before: [f32; 3], out: [f32; 3]| {
+        let [h, s, _] = rgb_to_hsl(out);
+        hsl_to_rgb([h, s, rgb_to_hsl(before)[2]])
+    };
+    match eight_mut(image) {
+        Some(image) => {
+            let luts: [[u8; 256]; 3] = std::array::from_fn(|c| {
+                std::array::from_fn(|v| {
+                    let t = unit(v as u8);
+                    byte(t + shift(c, t))
+                })
+            });
+            map_rgb(image, |c| {
+                let out = std::array::from_fn(|i| luts[i][c[i] as usize]);
+                if !preserve {
+                    return out;
+                }
+                keep_lightness(c.map(unit), out.map(unit)).map(byte)
+            });
         }
-        let [h, s, _] = rgb_to_hsl(out.map(unit));
-        let l = rgb_to_hsl(c.map(unit))[2];
-        hsl_to_rgb([h, s, l]).map(byte)
-    });
+        None => map_unit(image, |c| {
+            let out = std::array::from_fn(|i| c[i] + shift(i, c[i]));
+            if preserve {
+                keep_lightness(clamp_unit(c), clamp_unit(out))
+            } else {
+                out
+            }
+        }),
+    }
 }
 
-/// Grey value: the dullest channel, plus the secondary-sector part and the primary-sector part
-/// each weighted by its slider.
+/// Grey value of 8-bit channels, as [`black_white_grey`].
 fn black_white(c: [u8; 3], weights: &[f32; 6]) -> u8 {
-    let [top, second, last] = order(c);
-    let (primary, secondary) = sectors(top, second);
-    let (max, mid, min) = (c[top] as f32, c[second] as f32, c[last] as f32);
-    let grey =
-        min + (mid - min) * weights[secondary] / 100.0 + (max - mid) * weights[primary] / 100.0;
-    grey.round().clamp(0.0, 255.0) as u8
+    black_white_grey(c.map(|v| v as f32), weights)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
-fn selective_color(c: [u8; 3], ranges: &[[f32; 4]; 9], absolute: bool) -> [u8; 3] {
+/// Grey value (same scale as `c`): the dullest channel, plus the secondary-sector part and the
+/// primary-sector part each weighted by its slider.
+fn black_white_grey(c: [f32; 3], weights: &[f32; 6]) -> f32 {
     let [top, second, last] = order(c);
     let (primary, secondary) = sectors(top, second);
-    let v = c.map(unit);
+    let (max, mid, min) = (c[top], c[second], c[last]);
+    min + (mid - min) * weights[secondary] / 100.0 + (max - mid) * weights[primary] / 100.0
+}
+
+fn selective_color(c: [f32; 3], ranges: &[[f32; 4]; 9], absolute: bool) -> [f32; 3] {
+    let v = clamp_unit(c);
+    let [top, second, last] = order(v);
+    let (primary, secondary) = sectors(top, second);
     let (max, mid, min) = (v[top], v[second], v[last]);
     let mut amounts = [0.0f32; 9];
     amounts[primary] = max - mid;
@@ -1115,16 +1308,16 @@ fn selective_color(c: [u8; 3], ranges: &[[f32; 4]; 9], absolute: bool) -> [u8; 3
                 };
         }
     }
-    out.map(byte)
+    out
 }
 
-fn color_lookup(image: &mut RgbaImage, size: usize, table: &[[f32; 3]]) {
+fn color_lookup<S: Sample>(image: &mut Image<S>, size: usize, table: &[[f32; 3]]) {
     if size < 2 || size.checked_pow(3) != Some(table.len()) {
         return;
     }
     let last = size - 1;
     map_unit(image, |c| {
-        let p = c.map(|v| v * last as f32);
+        let p = clamp_unit(c).map(|v| v * last as f32);
         let i0 = p.map(|x| (x as usize).min(last - 1));
         let f: [f32; 3] = std::array::from_fn(|i| p[i] - i0[i] as f32);
         let mut out = [0.0f32; 3];
@@ -1172,16 +1365,16 @@ fn clip_bounds(hist: &[u32; 256]) -> (u8, u8) {
     (low as u8, high as u8)
 }
 
-fn stretch_lut(low: u8, high: u8) -> [u8; 256] {
+/// Levels taking `low` to black and `high` to white (identity if they are not in order).
+fn stretch(low: u8, high: u8) -> Levels {
     if high <= low {
-        return std::array::from_fn(|v| v as u8);
+        return Levels::default();
     }
     Levels {
         in_black: low,
         in_white: high,
         ..Levels::default()
     }
-    .lut()
 }
 
 /// Per-channel mean and standard deviation (0..255) of the visible pixels.
@@ -1405,6 +1598,119 @@ mod tests {
         auto_contrast(&mut image);
         assert_eq!(image.get_pixel(0, 0)[0], 0);
         assert_eq!(image.get_pixel(9, 0)[0], 255);
+    }
+
+    /// `adjust` on the 8-bit sample and on the same pixels as floats agree within 1/255
+    /// (floats clamped to white, as 8 bits clip).
+    fn deep_matches_eight(name: &str, adjust: impl Fn(&mut RgbaImage, &mut crate::DeepImage)) {
+        let mut eight = sample();
+        let mut deep = crate::depth::to_deep(&eight);
+        adjust(&mut eight, &mut deep);
+        for (a, b) in eight.as_raw().iter().zip(deep.as_raw()) {
+            assert!(
+                (*a as f32 - b.min(1.0) * 255.0).abs() <= 1.0 + 1e-3,
+                "{name}: {a} vs {}",
+                b * 255.0
+            );
+        }
+    }
+
+    #[test]
+    fn deep_images_match_eight_bits() {
+        let adjustments = [
+            Adjustment::BrightnessContrast {
+                brightness: 40.0,
+                contrast: 30.0,
+            },
+            Adjustment::Levels {
+                channels: [
+                    Levels {
+                        in_black: 20,
+                        in_white: 200,
+                        gamma: 1.4,
+                        out_black: 5,
+                        out_white: 240,
+                    },
+                    Levels::default(),
+                    Levels::default(),
+                    Levels::default(),
+                ],
+            },
+            Adjustment::Curves {
+                channels: [
+                    vec![(0, 0), (64, 40), (192, 220), (255, 255)],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ],
+            },
+            Adjustment::Exposure {
+                exposure: 0.7,
+                offset: 0.01,
+                gamma: 1.2,
+            },
+            Adjustment::HueSaturation {
+                hue: 40.0,
+                saturation: 30.0,
+                lightness: -10.0,
+                colorize: false,
+            },
+            Adjustment::ColorBalance {
+                shadows: [10.0, -20.0, 30.0],
+                midtones: [40.0, 0.0, -50.0],
+                highlights: [0.0, 20.0, 10.0],
+                preserve_luminosity: false,
+            },
+            Adjustment::BlackWhite {
+                weights: [40.0, 60.0, 40.0, 60.0, 20.0, 80.0],
+                tint: None,
+            },
+            Adjustment::Invert,
+            Adjustment::GradientMap {
+                stops: vec![(0.0, [10, 0, 80]), (1.0, [255, 250, 200])],
+                reverse: false,
+            },
+        ];
+        for adjustment in &adjustments {
+            deep_matches_eight(adjustment.name(), |eight, deep| {
+                adjustment.apply(eight);
+                adjustment.apply(deep);
+            });
+        }
+        deep_matches_eight("desaturate", |eight, deep| {
+            desaturate(eight);
+            desaturate(deep);
+        });
+        deep_matches_eight("equalize", |eight, deep| {
+            equalize(eight);
+            equalize(deep);
+        });
+        deep_matches_eight("auto contrast", |eight, deep| {
+            auto_contrast(eight);
+            auto_contrast(deep);
+        });
+    }
+
+    #[test]
+    fn deep_light_above_white_is_kept() {
+        let mut deep = crate::DeepImage::from_pixel(2, 1, Rgba([0.9, 2.0, 0.5, 1.0]));
+        Adjustment::Exposure {
+            exposure: 1.0,
+            offset: 0.0,
+            gamma: 1.0,
+        }
+        .apply(&mut deep);
+        let p = deep.get_pixel(0, 0);
+        assert!(p[0] > 1.0 && p[1] > 2.0, "{p:?}");
+        assert_eq!(p[3], 1.0, "alpha untouched");
+        let mut deep = crate::DeepImage::from_pixel(1, 1, Rgba([1.5, 0.5, 0.0, 1.0]));
+        Adjustment::default_of("Levels")
+            .expect("known kind")
+            .apply(&mut deep);
+        assert!(
+            (deep.get_pixel(0, 0)[0] - 1.5).abs() < 1e-5,
+            "neutral levels keep light"
+        );
     }
 
     #[test]

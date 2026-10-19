@@ -4,7 +4,11 @@ use image::GrayImage;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use std::any::Any;
+use std::borrow::Cow;
+
 use crate::blend::{self, Blend};
+use crate::depth::{self, Depth, Image, Raster, Sample};
 use crate::{RgbaImage, select};
 
 /// Tip settings shared by every painting tool.
@@ -205,6 +209,7 @@ pub struct Gradient {
     pub start: (f32, f32),
     pub end: (f32, f32),
     pub reverse: bool,
+    /// Noise against banding (8 bits only).
     pub dither: bool,
 }
 
@@ -264,7 +269,8 @@ impl Gradient {
     }
 
     /// Draw over the whole image, replacing pixels inside `selection` (soft).
-    pub fn draw(&self, image: &mut RgbaImage, selection: Option<&GrayImage>) {
+    /// Dithering only applies at 8 bits, where it hides banding.
+    pub fn draw<S: Sample>(&self, image: &mut Image<S>, selection: Option<&GrayImage>) {
         let width = image.width() as usize;
         let selection = selection
             .filter(|m| m.dimensions() == image.dimensions())
@@ -279,14 +285,17 @@ impl Gradient {
                 }
                 let (x, y) = ((index % width) as u32, (index / width) as u32);
                 let mut color = self.color_f(self.t_at(x as f32 + 0.5, y as f32 + 0.5));
-                if self.dither {
-                    let jitter = blend::noise(x, y) - 0.5;
-                    color = color.map(|v| v + jitter);
+                if S::EIGHT {
+                    if self.dither {
+                        let jitter = blend::noise(x, y) - 0.5;
+                        color = color.map(|v| v + jitter);
+                    }
+                    color = color.map(|v| v.round().clamp(0.0, 255.0));
                 }
                 for channel in 0..4 {
-                    let old = pixel[channel] as f32;
-                    let new = color[channel].round().clamp(0.0, 255.0);
-                    pixel[channel] = (old + (new - old) * amount).round() as u8;
+                    let old = pixel[channel].unit();
+                    let new = color[channel] / 255.0;
+                    pixel[channel] = S::from_unit(old + (new - old) * amount);
                 }
             });
     }
@@ -389,15 +398,15 @@ pub enum Tool {
     BackgroundEraser {
         tolerance: u8,
     },
-    /// Paints `source` read at (point + offset).
+    /// Paints `source` read at (point + offset), at the depth of the painted image.
     CloneStamp {
         offset: (f32, f32),
-        source: RgbaImage,
+        source: Raster,
     },
     /// Like the clone stamp, matched to the colour around the destination.
     HealingBrush {
         offset: (f32, f32),
-        source: RgbaImage,
+        source: Raster,
     },
     /// Fills each dab from the ring around it.
     SpotHealing,
@@ -406,7 +415,7 @@ pub enum Tool {
     },
     /// Paints back an earlier state of the same layer.
     HistoryBrush {
-        source: RgbaImage,
+        source: Raster,
     },
     Blur {
         strength: f32,
@@ -443,7 +452,8 @@ pub enum Tool {
     },
 }
 
-/// A stroke in progress; the app feeds pointer positions.
+/// A stroke in progress; the app feeds pointer positions. Colours it keeps are fractions
+/// (0..1, above for very bright deep colours), so one stroke works at every depth.
 #[derive(Clone, Debug, Default)]
 pub struct Stroke {
     /// Last painted position and pressure.
@@ -453,12 +463,12 @@ pub struct Stroke {
     /// Distance travelled since the last dab.
     leftover: f32,
     dabs: u32,
-    /// The image when the stroke started.
-    base: Option<RgbaImage>,
+    /// The image when the stroke started, at its depth.
+    base: Option<Raster>,
     /// Everything this stroke laid so far, before opacity: what keeps one stroke under its opacity.
-    layer: Option<RgbaImage>,
+    layer: Option<Raster>,
     /// Colour under the centre at the start (background eraser, colour replacement).
-    sampled: Option<[u8; 4]>,
+    sampled: Option<[f32; 4]>,
     /// Mixer brush reservoir.
     pickup: Option<[f32; 4]>,
     /// Smudge: colours carried, around the dab centre.
@@ -519,9 +529,9 @@ impl Stroke {
     /// `source` tools (clone/healing/history) read from their source image at (point + offset).
     /// Selection limits painting (soft).
     #[allow(clippy::too_many_arguments)]
-    pub fn to(
+    pub fn to<S: Sample>(
         &mut self,
-        image: &mut RgbaImage,
+        image: &mut Image<S>,
         x: f32,
         y: f32,
         pressure: f32,
@@ -533,7 +543,11 @@ impl Stroke {
         if w == 0 || h == 0 {
             return None;
         }
-        if self.base.as_ref().is_some_and(|b| b.dimensions() != (w, h)) {
+        if self
+            .base
+            .as_ref()
+            .is_some_and(|b| b.dimensions() != (w, h) || b.is_deep() == S::EIGHT)
+        {
             *self = Self::default();
         }
         let selection = selection.filter(|m| m.dimensions() == (w, h));
@@ -571,9 +585,9 @@ impl Stroke {
         dirty.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
     }
 
-    fn dab(
+    fn dab<S: Sample>(
         &mut self,
-        image: &mut RgbaImage,
+        image: &mut Image<S>,
         (cx, cy): (f32, f32),
         pressure: f32,
         context: &Context,
@@ -610,15 +624,26 @@ impl Stroke {
     }
 
     /// Keep the image as it was at the stroke start, and the stroke's own coverage.
-    fn start_layer(&mut self, image: &RgbaImage) {
+    fn start_layer<S: Sample>(&mut self, image: &Image<S>) {
         if self.base.is_none() {
-            self.base = Some(image.clone());
-            self.layer = Some(RgbaImage::new(image.width(), image.height()));
+            let depth = if S::EIGHT { Depth::Eight } else { Depth::Float };
+            self.base = Some(if S::EIGHT {
+                Raster::Eight(depth::convert(image))
+            } else {
+                Raster::Deep(depth::convert(image))
+            });
+            self.layer = Some(Raster::new(image.width(), image.height(), depth));
         }
     }
 
     /// Tools that lay colour: brush, pencil, stamps, healing, history, mixer.
-    fn paint(&mut self, image: &mut RgbaImage, dab: &Dab, context: &Context, random: f32) {
+    fn paint<S: Sample>(
+        &mut self,
+        image: &mut Image<S>,
+        dab: &Dab,
+        context: &Context,
+        random: f32,
+    ) {
         let (brush, tool) = (context.brush, context.tool);
         self.start_layer(image);
         let blend = if let Tool::Brush { blend, .. } = tool {
@@ -628,7 +653,7 @@ impl Stroke {
         };
         let fixed = match tool {
             Tool::Brush { color, .. } | Tool::Pencil { color } => {
-                Some(shift_hue(*color, (random - 0.5) * brush.jitter_hue))
+                Some(unit(shift_hue(*color, (random - 0.5) * brush.jitter_hue)))
             }
             Tool::MixerBrush { color, wet, mix } => {
                 Some(self.mixer_color(image, dab, *color, *wet, *mix))
@@ -655,67 +680,70 @@ impl Stroke {
                 }
                 Tool::HealingBrush { offset, source } => {
                     fetch(source, x as f32 + offset.0, y as f32 + offset.1).map(|c| {
-                        [0, 1, 2, 3].map(|i| {
-                            if i < 3 {
-                                add(c[i], heal_shift[i])
-                            } else {
-                                c[3]
-                            }
-                        })
+                        [
+                            c[0] + heal_shift[0],
+                            c[1] + heal_shift[1],
+                            c[2] + heal_shift[2],
+                            c[3],
+                        ]
                     })
                 }
                 Tool::SpotHealing => ring
                     .as_deref()
                     .and_then(|ring| inverse_distance(ring, x, y)),
-                Tool::PatternStamp { pattern } => Some(pattern.sample(x as i64, y as i64, 1.0)),
+                Tool::PatternStamp { pattern } => {
+                    Some(unit(pattern.sample(x as i64, y as i64, 1.0)))
+                }
                 Tool::HistoryBrush { source } => fetch(source, x as f32, y as f32),
                 _ => fixed,
             };
-            let Some(color) = color else { continue };
+            let Some(color) = color.map(stored::<S>) else {
+                continue;
+            };
             let rgb = [color[0], color[1], color[2]];
-            let amount = weight * brush.flow.clamp(0.0, 1.0) * color[3] as f32 / 255.0;
+            let amount = weight * brush.flow.clamp(0.0, 1.0) * color[3];
             let selected = context.selected(x, y);
             if brush.build_up {
                 let alpha = dissolve(blend, amount * brush.opacity * selected, x, y);
-                let out = blend::over(image.get_pixel(x, y).0, rgb, alpha, blend);
-                image.put_pixel(x, y, crate::Rgba(out));
+                let out = blend::over_unit(get(image, x, y), rgb, alpha, blend);
+                put(image, x, y, out);
             } else {
-                let laid = blend::over(layer.get_pixel(x, y).0, rgb, amount, Blend::Normal);
-                layer.put_pixel(x, y, crate::Rgba(laid));
-                let alpha = dissolve(
-                    blend,
-                    laid[3] as f32 / 255.0 * brush.opacity * selected,
-                    x,
-                    y,
-                );
-                let out = blend::over(
-                    base.get_pixel(x, y).0,
+                let laid = stored::<S>(blend::over_unit(
+                    raster_get(layer, x, y),
+                    rgb,
+                    amount,
+                    Blend::Normal,
+                ));
+                raster_put(layer, x, y, laid);
+                let alpha = dissolve(blend, laid[3] * brush.opacity * selected, x, y);
+                let out = blend::over_unit(
+                    raster_get(base, x, y),
                     [laid[0], laid[1], laid[2]],
                     alpha,
                     blend,
                 );
-                image.put_pixel(x, y, crate::Rgba(out));
+                put(image, x, y, out);
             }
         }
     }
 
     /// Mixer brush: refill the reservoir from the canvas under the dab, return the paint colour.
-    fn mixer_color(
+    fn mixer_color<S: Sample>(
         &mut self,
-        image: &RgbaImage,
+        image: &Image<S>,
         dab: &Dab,
         color: [u8; 4],
         wet: f32,
         mix: f32,
-    ) -> [u8; 4] {
+    ) -> [f32; 4] {
         let mut sum = [0.0f32; 4];
         let mut total = 0.0;
         for (x, y, weight) in dab.pixels() {
-            let p = image.get_pixel(x, y).0;
-            (0..4).for_each(|c| sum[c] += p[c] as f32 * weight);
+            let p = get(image, x, y);
+            (0..4).for_each(|c| sum[c] += p[c] * weight);
             total += weight;
         }
-        let paint = color.map(|v| v as f32);
+        let paint = unit(color);
         let mut pickup = self.pickup.unwrap_or(paint);
         if total > 0.0 {
             let wet = wet.clamp(0.0, 1.0);
@@ -723,16 +751,12 @@ impl Stroke {
         }
         self.pickup = Some(pickup);
         let mix = mix.clamp(0.0, 1.0);
-        let out = [0, 1, 2].map(|c| {
-            (paint[c] + (pickup[c] - paint[c]) * mix)
-                .round()
-                .clamp(0.0, 255.0) as u8
-        });
-        [out[0], out[1], out[2], color[3]]
+        let out = [0, 1, 2].map(|c| paint[c] + (pickup[c] - paint[c]) * mix);
+        [out[0], out[1], out[2], paint[3]]
     }
 
     /// Eraser and background eraser: lower alpha.
-    fn erase(&mut self, image: &mut RgbaImage, dab: &Dab, context: &Context) {
+    fn erase<S: Sample>(&mut self, image: &mut Image<S>, dab: &Dab, context: &Context) {
         let brush = context.brush;
         self.start_layer(image);
         let Stroke {
@@ -746,8 +770,8 @@ impl Stroke {
         };
         let tolerance = match context.tool {
             Tool::BackgroundEraser { tolerance } => {
-                let (x, y) = clamp_point(base, dab.cx, dab.cy);
-                sampled.get_or_insert(base.get_pixel(x, y).0);
+                let (x, y) = clamp_point(base.dimensions(), dab.cx, dab.cy);
+                sampled.get_or_insert(raster_get(base, x, y));
                 Some(*tolerance as f32)
             }
             _ => None,
@@ -755,47 +779,45 @@ impl Stroke {
         for (x, y, weight) in dab.pixels() {
             let mut amount = weight * brush.flow.clamp(0.0, 1.0);
             if let (Some(tolerance), Some(sample)) = (tolerance, *sampled) {
-                let p = base.get_pixel(x, y).0;
-                let d = (0..3).map(|c| p[c].abs_diff(sample[c])).max().unwrap_or(0) as f32;
+                let d = difference(raster_get(base, x, y), sample);
                 amount *= ((tolerance + 8.0 - d) / 8.0).clamp(0.0, 1.0);
             }
             let selected = context.selected(x, y);
             let mut p = if brush.build_up {
-                image.get_pixel(x, y).0
+                get(image, x, y)
             } else {
-                base.get_pixel(x, y).0
+                raster_get(base, x, y)
             };
             let cut = if brush.build_up {
                 amount
             } else {
-                let l = layer.get_pixel_mut(x, y);
-                let laid = l[3] as f32 / 255.0;
-                let laid = laid + amount * (1.0 - laid);
-                l[3] = (laid * 255.0).round() as u8;
+                let mut l = raster_get(layer, x, y);
+                let laid = l[3] + amount * (1.0 - l[3]);
+                l[3] = laid;
+                raster_put(layer, x, y, l);
                 laid
             };
-            p[3] = (p[3] as f32 * (1.0 - cut * brush.opacity * selected)).round() as u8;
-            image.put_pixel(x, y, crate::Rgba(p));
+            p[3] *= 1.0 - cut * brush.opacity * selected;
+            put(image, x, y, p);
         }
     }
 
     /// Tools that rework the pixels in place: blur, sharpen, smudge, dodge, burn, sponge, colour replacement.
-    fn retouch(&mut self, image: &mut RgbaImage, dab: &Dab, context: &Context) {
+    fn retouch<S: Sample>(&mut self, image: &mut Image<S>, dab: &Dab, context: &Context) {
         let brush = context.brush;
         let reach = (brush.opacity * brush.flow).clamp(0.0, 1.0);
         if let Tool::Smudge { strength } = context.tool {
             self.smudge(image, dab, context, strength.clamp(0.0, 1.0) * reach);
             return;
         }
-        let snapshot = image.clone_region(dab);
+        let snapshot = Region::around(image, dab);
         if let Tool::ColorReplacement { .. } = context.tool {
-            let (x, y) = clamp_point(image, dab.cx, dab.cy);
-            self.sampled.get_or_insert(image.get_pixel(x, y).0);
+            let (x, y) = clamp_point(image.dimensions(), dab.cx, dab.cy);
+            self.sampled.get_or_insert(get(image, x, y));
         }
         for (x, y, weight) in dab.pixels() {
-            let p = image.get_pixel(x, y).0;
-            let c = p.map(|v| v as f32);
-            let lightness = crate::luma(p[0], p[1], p[2]) as f32 / 255.0;
+            let c = get(image, x, y);
+            let lightness = lightness::<S>(c);
             let (new, strength): ([f32; 4], f32) = match context.tool {
                 Tool::Blur { strength } => (snapshot.average(x, y), *strength),
                 Tool::Sharpen { strength } => {
@@ -807,39 +829,43 @@ impl Stroke {
                 }
                 Tool::Dodge { exposure, range } => {
                     let k = 1.0 + exposure.clamp(0.0, 1.0) * range.weight(lightness);
-                    (with_rgb(c, |v| v * k + (k - 1.0) * 8.0), 1.0)
+                    (with_rgb(c, |v| v * k + (k - 1.0) * 8.0 / 255.0), 1.0)
                 }
                 Tool::Burn { exposure, range } => {
                     let k = 1.0 - 0.5 * exposure.clamp(0.0, 1.0) * range.weight(lightness);
                     (with_rgb(c, |v| v * k), 1.0)
                 }
                 Tool::Sponge { flow, saturate } => {
-                    let l = lightness * 255.0;
                     let k = if *saturate { 1.6 } else { 0.0 };
-                    (with_rgb(c, |v| l + (v - l) * k), *flow)
+                    (with_rgb(c, |v| lightness + (v - lightness) * k), *flow)
                 }
                 Tool::ColorReplacement { color, tolerance } => {
-                    let sample = self.sampled.unwrap_or(p);
-                    let d = (0..3).map(|i| p[i].abs_diff(sample[i])).max().unwrap_or(0) as f32;
+                    let d = difference(c, self.sampled.unwrap_or(c));
                     let near = ((*tolerance as f32 + 8.0 - d) / 8.0).clamp(0.0, 1.0);
-                    let unit = |v: [u8; 4]| [v[0], v[1], v[2]].map(|v| v as f32 / 255.0);
-                    let mixed = Blend::Color.mix(unit(p), unit(*color));
-                    (
-                        [mixed[0] * 255.0, mixed[1] * 255.0, mixed[2] * 255.0, c[3]],
-                        near,
-                    )
+                    let rgb = |v: [f32; 4]| [v[0], v[1], v[2]].map(|v| v.clamp(0.0, 1.0));
+                    let mixed = Blend::Color.mix(rgb(c), rgb(unit(*color)));
+                    ([mixed[0], mixed[1], mixed[2], c[3]], near)
                 }
                 _ => (c, 0.0),
             };
             let t = weight * context.selected(x, y) * reach * strength.clamp(0.0, 1.0);
-            let out =
-                [0, 1, 2, 3].map(|i| (c[i] + (new[i] - c[i]) * t).round().clamp(0.0, 255.0) as u8);
-            image.put_pixel(x, y, crate::Rgba(out));
+            put(
+                image,
+                x,
+                y,
+                [0, 1, 2, 3].map(|i| c[i] + (new[i] - c[i]) * t),
+            );
         }
     }
 
     /// Smudge: drag the colours picked up at the previous dab.
-    fn smudge(&mut self, image: &mut RgbaImage, dab: &Dab, context: &Context, strength: f32) {
+    fn smudge<S: Sample>(
+        &mut self,
+        image: &mut Image<S>,
+        dab: &Dab,
+        context: &Context,
+        strength: f32,
+    ) {
         let (icx, icy) = (dab.cx.floor() as i64, dab.cy.floor() as i64);
         let first = self.patch.is_empty();
         if first {
@@ -854,18 +880,14 @@ impl Stroke {
                 continue;
             }
             let k = (ry * side + rx) as usize;
-            let current = image.get_pixel(x, y).0.map(|v| v as f32);
+            let current = get(image, x, y);
             let Some(carried) = self.patch[k] else {
                 self.patch[k] = Some(current);
                 continue;
             };
             let t = strength * weight * context.selected(x, y);
             let new = [0, 1, 2, 3].map(|i| current[i] + (carried[i] - current[i]) * t);
-            image.put_pixel(
-                x,
-                y,
-                crate::Rgba(new.map(|v| v.round().clamp(0.0, 255.0) as u8)),
-            );
+            put(image, x, y, new);
             self.patch[k] = Some([0, 1, 2, 3].map(|i| new[i] + (carried[i] - new[i]) * strength));
         }
     }
@@ -941,45 +963,39 @@ fn make_dab(
 }
 
 /// A copy of the pixels around a dab (one pixel wider), read clamped.
-struct Region {
-    image: RgbaImage,
+struct Region<S: Sample> {
+    image: Image<S>,
     x0: u32,
     y0: u32,
 }
 
-trait CloneRegion {
-    fn clone_region(&self, dab: &Dab) -> Region;
-}
-
-impl CloneRegion for RgbaImage {
-    fn clone_region(&self, dab: &Dab) -> Region {
+impl<S: Sample> Region<S> {
+    fn around(image: &Image<S>, dab: &Dab) -> Self {
         let rows = (dab.weights.len() / (dab.x1 - dab.x0) as usize) as u32;
         let (x0, y0) = (dab.x0.saturating_sub(1), dab.y0.saturating_sub(1));
-        let x1 = (dab.x1 + 1).min(self.width());
-        let y1 = (dab.y0 + rows + 1).min(self.height());
+        let x1 = (dab.x1 + 1).min(image.width());
+        let y1 = (dab.y0 + rows + 1).min(image.height());
         Region {
-            image: crate::transform::crop(self, x0, y0, x1 - x0, y1 - y0),
+            image: crate::transform::crop(image, x0, y0, x1 - x0, y1 - y0),
             x0,
             y0,
         }
     }
-}
 
-impl Region {
-    /// Alpha-weighted mean of the 3x3 pixels around (x, y).
+    /// Alpha-weighted mean of the 3x3 pixels around (x, y), as fractions.
     fn average(&self, x: u32, y: u32) -> [f32; 4] {
         let (w, h) = (self.image.width() as i64, self.image.height() as i64);
         let (lx, ly) = (x as i64 - self.x0 as i64, y as i64 - self.y0 as i64);
         let mut sum = [0.0f32; 4];
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let p = self.image.get_pixel(
+                let p = get(
+                    &self.image,
                     (lx + dx).clamp(0, w - 1) as u32,
                     (ly + dy).clamp(0, h - 1) as u32,
                 );
-                let a = p[3] as f32;
-                (0..3).for_each(|c| sum[c] += p[c] as f32 * a);
-                sum[3] += a;
+                (0..3).for_each(|c| sum[c] += p[c] * p[3]);
+                sum[3] += p[3];
             }
         }
         if sum[3] <= 0.0 {
@@ -998,20 +1014,69 @@ fn with_rgb(c: [f32; 4], f: impl Fn(f32) -> f32) -> [f32; 4] {
     [f(c[0]), f(c[1]), f(c[2]), c[3]]
 }
 
-fn add(v: u8, by: f32) -> u8 {
-    (v as f32 + by).round().clamp(0.0, 255.0) as u8
+/// An 8-bit colour as fractions.
+fn unit(color: [u8; 4]) -> [f32; 4] {
+    color.map(|v| v.unit())
 }
 
-fn clamp_point(image: &RgbaImage, x: f32, y: f32) -> (u32, u32) {
+/// `color` as an image of depth `S` holds it (8 bits round and clamp).
+fn stored<S: Sample>(color: [f32; 4]) -> [f32; 4] {
+    color.map(|v| S::from_unit(v).unit())
+}
+
+/// Pixel (x, y) as fractions.
+fn get<S: Sample>(image: &Image<S>, x: u32, y: u32) -> [f32; 4] {
+    let p = image.get_pixel(x, y);
+    [p[0].unit(), p[1].unit(), p[2].unit(), p[3].unit()]
+}
+
+/// Set pixel (x, y) from fractions.
+fn put<S: Sample>(image: &mut Image<S>, x: u32, y: u32, color: [f32; 4]) {
+    image.put_pixel(x, y, S::rgba(color.map(S::from_unit)));
+}
+
+fn raster_get(raster: &Raster, x: u32, y: u32) -> [f32; 4] {
+    crate::with_raster!(raster, image => get(image, x, y))
+}
+
+fn raster_put(raster: &mut Raster, x: u32, y: u32, color: [f32; 4]) {
+    crate::with_raster!(raster, image => put(image, x, y, color))
+}
+
+/// Largest RGB difference, on the 0..255 scale tolerances use.
+fn difference(a: [f32; 4], b: [f32; 4]) -> f32 {
+    (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f32::max) * 255.0
+}
+
+/// Lightness 0..1 (Rec. 601 luma; rounded like 8-bit luma at 8 bits).
+fn lightness<S: Sample>(c: [f32; 4]) -> f32 {
+    if S::EIGHT {
+        let [r, g, b] = [c[0], c[1], c[2]].map(u8::from_unit);
+        crate::luma(r, g, b) as f32 / 255.0
+    } else {
+        0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+    }
+}
+
+/// The 8-bit view selections are made from.
+fn eight<S: Sample>(image: &Image<S>) -> Cow<'_, RgbaImage> {
+    match (image as &dyn Any).downcast_ref::<RgbaImage>() {
+        Some(image) => Cow::Borrowed(image),
+        None => Cow::Owned(depth::convert(image)),
+    }
+}
+
+fn clamp_point((w, h): (u32, u32), x: f32, y: f32) -> (u32, u32) {
     let clamp = |v: f32, max: u32| (v.floor().max(0.0) as u32).min(max.saturating_sub(1));
-    (clamp(x, image.width()), clamp(y, image.height()))
+    (clamp(x, w), clamp(y, h))
 }
 
-/// The pixel at (x, y) if inside the image.
-fn fetch(image: &RgbaImage, x: f32, y: f32) -> Option<[u8; 4]> {
+/// The pixel at (x, y) as fractions, if inside the image.
+fn fetch(image: &Raster, x: f32, y: f32) -> Option<[f32; 4]> {
     let (x, y) = (x.round() as i64, y.round() as i64);
-    (x >= 0 && y >= 0 && x < image.width() as i64 && y < image.height() as i64)
-        .then(|| image.get_pixel(x as u32, y as u32).0)
+    let (w, h) = image.dimensions();
+    (x >= 0 && y >= 0 && x < w as i64 && y < h as i64)
+        .then(|| raster_get(image, x as u32, y as u32))
 }
 
 /// Dissolve shows each pixel fully or not at all.
@@ -1037,17 +1102,17 @@ fn shift_hue(color: [u8; 4], turns: f32) -> [u8; 4] {
 }
 
 /// Mean colour difference destination minus source over the dab (healing brush).
-fn heal_shift(base: &RgbaImage, source: &RgbaImage, offset: (f32, f32), dab: &Dab) -> [f32; 3] {
+fn heal_shift(base: &Raster, source: &Raster, offset: (f32, f32), dab: &Dab) -> [f32; 3] {
     let (mut dst, mut src) = ([0.0f32; 3], [0.0f32; 3]);
     let mut total = 0.0;
     for (x, y, weight) in dab.pixels() {
         let Some(s) = fetch(source, x as f32 + offset.0, y as f32 + offset.1) else {
             continue;
         };
-        let d = base.get_pixel(x, y).0;
+        let d = raster_get(base, x, y);
         for c in 0..3 {
-            dst[c] += d[c] as f32 * weight;
-            src[c] += s[c] as f32 * weight;
+            dst[c] += d[c] * weight;
+            src[c] += s[c] * weight;
         }
         total += weight;
     }
@@ -1058,19 +1123,19 @@ fn heal_shift(base: &RgbaImage, source: &RgbaImage, offset: (f32, f32), dab: &Da
 }
 
 /// Colours on a ring just outside the dab (spot healing).
-fn ring_samples(base: &RgbaImage, dab: &Dab) -> Vec<(f32, f32, [f32; 4])> {
+fn ring_samples(base: &Raster, dab: &Dab) -> Vec<(f32, f32, [f32; 4])> {
     let r = dab.radius * 1.25 + 2.0;
     (0..32)
         .filter_map(|k| {
             let angle = k as f32 / 32.0 * std::f32::consts::TAU;
             let (x, y) = (dab.cx + r * angle.cos(), dab.cy + r * angle.sin());
-            fetch(base, x - 0.5, y - 0.5).map(|c| (x, y, c.map(|v| v as f32)))
+            fetch(base, x - 0.5, y - 0.5).map(|c| (x, y, c))
         })
         .collect()
 }
 
 /// Inverse-distance-weighted mix of the ring colours at pixel (x, y).
-fn inverse_distance(ring: &[(f32, f32, [f32; 4])], x: u32, y: u32) -> Option<[u8; 4]> {
+fn inverse_distance(ring: &[(f32, f32, [f32; 4])], x: u32, y: u32) -> Option<[f32; 4]> {
     let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
     let mut sum = [0.0f32; 4];
     let mut total = 0.0;
@@ -1079,14 +1144,14 @@ fn inverse_distance(ring: &[(f32, f32, [f32; 4])], x: u32, y: u32) -> Option<[u8
         (0..4).for_each(|c| sum[c] += color[c] * weight);
         total += weight;
     }
-    (total > 0.0).then(|| sum.map(|v| (v / total).round().clamp(0.0, 255.0) as u8))
+    (total > 0.0).then(|| sum.map(|v| v / total))
 }
 
-/// Put `paint(x, y)` = (colour, alpha) over every pixel, in parallel.
-fn paint_where(
-    image: &mut RgbaImage,
+/// Put `paint(x, y)` = (colour as fractions, alpha) over every pixel, in parallel.
+fn paint_where<S: Sample>(
+    image: &mut Image<S>,
     blend: Blend,
-    paint: impl Fn(u32, u32) -> Option<([u8; 3], f32)> + Sync,
+    paint: impl Fn(u32, u32) -> Option<([f32; 3], f32)> + Sync,
 ) {
     let width = image.width() as usize;
     if width == 0 {
@@ -1105,7 +1170,11 @@ fn paint_where(
                 if alpha <= 0.0 {
                     continue;
                 }
-                p.copy_from_slice(&blend::over([p[0], p[1], p[2], p[3]], rgb, alpha, blend));
+                let under = [p[0].unit(), p[1].unit(), p[2].unit(), p[3].unit()];
+                let out = blend::over_unit(under, rgb, alpha, blend);
+                for (slot, value) in p.iter_mut().zip(out) {
+                    *slot = S::from_unit(value);
+                }
             }
         });
 }
@@ -1114,10 +1183,14 @@ fn selected_at(selection: Option<&GrayImage>, x: u32, y: u32) -> f32 {
     selection.map_or(1.0, |m| m.get_pixel(x, y)[0] as f32 / 255.0)
 }
 
-/// Paint bucket: fill the pixels like the one at (x, y).
+fn rgb_of(color: [u8; 4]) -> [f32; 3] {
+    [color[0], color[1], color[2]].map(|v| v.unit())
+}
+
+/// Paint bucket: fill the pixels like the one at (x, y) (compared at 8 bits).
 #[allow(clippy::too_many_arguments)]
-pub fn fill(
-    image: &mut RgbaImage,
+pub fn fill<S: Sample>(
+    image: &mut Image<S>,
     x: u32,
     y: u32,
     color: [u8; 4],
@@ -1130,9 +1203,9 @@ pub fn fill(
     if x >= image.width() || y >= image.height() {
         return;
     }
-    let region = select::magic_wand(image, x, y, tolerance, contiguous);
+    let region = select::magic_wand(&eight(image), x, y, tolerance, contiguous);
     let selection = selection.filter(|m| m.dimensions() == image.dimensions());
-    let rgb = [color[0], color[1], color[2]];
+    let rgb = rgb_of(color);
     let alpha = opacity * color[3] as f32 / 255.0;
     paint_where(image, blend, |x, y| {
         let inside = region.get_pixel(x, y)[0];
@@ -1146,8 +1219,8 @@ pub fn fill(
 }
 
 /// Fill the selection (or everything) with a pattern.
-pub fn fill_pattern(
-    image: &mut RgbaImage,
+pub fn fill_pattern<S: Sample>(
+    image: &mut Image<S>,
     pattern: &crate::style::Pattern,
     selection: Option<&GrayImage>,
 ) {
@@ -1155,15 +1228,15 @@ pub fn fill_pattern(
     paint_where(image, Blend::Normal, |x, y| {
         let c = pattern.sample(x as i64, y as i64, 1.0);
         Some((
-            [c[0], c[1], c[2]],
+            rgb_of(c),
             c[3] as f32 / 255.0 * selected_at(selection, x, y),
         ))
     });
 }
 
 /// Fill the selection (or everything) with a colour.
-pub fn fill_selection(
-    image: &mut RgbaImage,
+pub fn fill_selection<S: Sample>(
+    image: &mut Image<S>,
     color: [u8; 4],
     selection: Option<&GrayImage>,
     opacity: f32,
@@ -1171,44 +1244,54 @@ pub fn fill_selection(
 ) {
     let selection = selection.filter(|m| m.dimensions() == image.dimensions());
     let alpha = opacity * color[3] as f32 / 255.0;
+    let rgb = rgb_of(color);
     paint_where(image, blend, |x, y| {
-        Some((
-            [color[0], color[1], color[2]],
-            alpha * selected_at(selection, x, y),
-        ))
+        Some((rgb, alpha * selected_at(selection, x, y)))
     });
 }
 
 /// Draw a line `width` wide centred on the selection edge.
-pub fn stroke_selection(image: &mut RgbaImage, selection: &GrayImage, width: f32, color: [u8; 4]) {
+pub fn stroke_selection<S: Sample>(
+    image: &mut Image<S>,
+    selection: &GrayImage,
+    width: f32,
+    color: [u8; 4],
+) {
     if selection.dimensions() != image.dimensions() {
         return;
     }
     let distance = select::signed_distance(selection);
     let (w, half) = (image.width(), width / 2.0);
     let alpha = color[3] as f32 / 255.0;
+    let rgb = rgb_of(color);
     paint_where(image, Blend::Normal, |x, y| {
         let d = distance[(y * w + x) as usize].abs();
         let cover = (half + 0.5 - d).clamp(0.0, 1.0);
-        (cover > 0.0).then_some(([color[0], color[1], color[2]], cover * alpha))
+        (cover > 0.0).then_some((rgb, cover * alpha))
     });
 }
 
-/// Erase the pixels like the one at (x, y).
-pub fn magic_erase(image: &mut RgbaImage, x: u32, y: u32, tolerance: u8, contiguous: bool) {
+/// Erase the pixels like the one at (x, y) (compared at 8 bits).
+pub fn magic_erase<S: Sample>(
+    image: &mut Image<S>,
+    x: u32,
+    y: u32,
+    tolerance: u8,
+    contiguous: bool,
+) {
     if x >= image.width() || y >= image.height() {
         return;
     }
-    let region = select::magic_wand(image, x, y, tolerance, contiguous);
+    let region = select::magic_wand(&eight(image), x, y, tolerance, contiguous);
     image
         .par_chunks_mut(4)
         .zip(region.as_raw().par_iter())
-        .for_each(|(p, &r)| p[3] = crate::mul(p[3], 255 - r));
+        .for_each(|(p, &r)| p[3] = S::from_unit(p[3].unit() * (1.0 - r as f32 / 255.0)));
 }
 
 /// Fill the masked region from its surroundings: push-pull pyramid (smooth fill from the
 /// border at every scale), then texture copied from a nearby known patch.
-pub fn content_aware_fill(image: &mut RgbaImage, region: &GrayImage) {
+pub fn content_aware_fill<S: Sample>(image: &mut Image<S>, region: &GrayImage) {
     let (w, h) = image.dimensions();
     if region.dimensions() != (w, h) {
         return;
@@ -1222,15 +1305,16 @@ pub fn content_aware_fill(image: &mut RgbaImage, region: &GrayImage) {
         .iter()
         .map(|&v| 1.0 - v as f32 / 255.0)
         .collect();
-    let colors: Vec<[f32; 4]> = image.pixels().map(|p| p.0.map(|v| v as f32)).collect();
+    let colors: Vec<[f32; 4]> = image
+        .pixels()
+        .map(|p| [p[0].unit(), p[1].unit(), p[2].unit(), p[3].unit()])
+        .collect();
     let mut filled = push_pull(&colors, &known, wu, hu);
     add_texture(&mut filled, &colors, &known, hole, wu, hu);
     image.par_chunks_mut(4).enumerate().for_each(|(i, p)| {
         let k = known[i];
         for c in 0..4 {
-            p[c] = (colors[i][c] * k + filled[i][c] * (1.0 - k))
-                .round()
-                .clamp(0.0, 255.0) as u8;
+            p[c] = S::from_unit(colors[i][c] * k + filled[i][c] * (1.0 - k));
         }
     });
 }
@@ -1349,7 +1433,7 @@ fn add_texture(
 }
 
 /// Take the red out of pupils inside `region`.
-pub fn red_eye(image: &mut RgbaImage, region: &GrayImage) {
+pub fn red_eye<S: Sample>(image: &mut Image<S>, region: &GrayImage) {
     if region.dimensions() != image.dimensions() {
         return;
     }
@@ -1360,17 +1444,17 @@ pub fn red_eye(image: &mut RgbaImage, region: &GrayImage) {
             if m == 0 {
                 return;
             }
-            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let (r, g, b) = (p[0].unit(), p[1].unit(), p[2].unit());
             let others = (g + b) / 2.0;
-            let redness = ((r - others) / 255.0 - 0.1) / 0.2;
+            let redness = ((r - others) - 0.1) / 0.2;
             let amount = redness.clamp(0.0, 1.0) * m as f32 / 255.0;
             if amount <= 0.0 {
                 return;
             }
             let dark = 1.0 - 0.2 * amount;
-            p[0] = ((r + (others - r) * amount) * dark).round() as u8;
-            p[1] = (g * dark).round() as u8;
-            p[2] = (b * dark).round() as u8;
+            p[0] = S::from_unit((r + (others - r) * amount) * dark);
+            p[1] = S::from_unit(g * dark);
+            p[2] = S::from_unit(b * dark);
         });
 }
 
@@ -1613,17 +1697,23 @@ pub(crate) fn stroke_coverage(
     mask
 }
 
-pub(crate) fn paint_coverage(image: &mut RgbaImage, coverage: &GrayImage, color: [u8; 4]) {
+/// Put `color` over `image` where `coverage` says, as much as it says.
+pub(crate) fn paint_coverage<S: Sample>(
+    image: &mut Image<S>,
+    coverage: &GrayImage,
+    color: [u8; 4],
+) {
     let alpha = color[3] as f32 / 255.0;
+    let rgb = rgb_of(color);
     paint_where(image, Blend::Normal, |x, y| {
         let c = coverage.get_pixel(x, y)[0];
-        (c > 0).then(|| ([color[0], color[1], color[2]], c as f32 / 255.0 * alpha))
+        (c > 0).then(|| (rgb, c as f32 / 255.0 * alpha))
     });
 }
 
 /// Draw a shape, antialiased: filled and/or stroked (colour, width).
-pub fn draw_shape(
-    image: &mut RgbaImage,
+pub fn draw_shape<S: Sample>(
+    image: &mut Image<S>,
     shape: &Shape,
     from: (f32, f32),
     to: (f32, f32),
@@ -1634,8 +1724,8 @@ pub fn draw_shape(
 }
 
 /// Draw a pen path: filled (implicitly closed) and/or stroked.
-pub fn draw_path(
-    image: &mut RgbaImage,
+pub fn draw_path<S: Sample>(
+    image: &mut Image<S>,
     points: &[(f32, f32)],
     closed: bool,
     fill: Option<[u8; 4]>,
@@ -1884,5 +1974,79 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    /// Every channel of `deep` within 1/255 of `eight`.
+    fn close(eight: &RgbaImage, deep: &crate::DeepImage) -> bool {
+        eight
+            .pixels()
+            .zip(deep.pixels())
+            .all(|(a, b)| (0..4).all(|c| (a[c] as f32 / 255.0 - b[c]).abs() <= 1.0 / 255.0 + 1e-6))
+    }
+
+    #[test]
+    fn deep_images_paint_like_eight_bit_ones() {
+        let start =
+            RgbaImage::from_fn(30, 30, |x, y| Rgba([(x * 8) as u8, (y * 8) as u8, 90, 255]));
+        let brush = Brush {
+            size: 12.0,
+            opacity: 0.7,
+            ..Brush::default()
+        };
+        let source = crate::Raster::Eight(start.clone());
+        for tool in [
+            Tool::Brush {
+                color: RED,
+                blend: Blend::Normal,
+            },
+            Tool::Eraser,
+            Tool::CloneStamp {
+                offset: (5.0, 0.0),
+                source: source.clone(),
+            },
+            Tool::HistoryBrush {
+                source: crate::Raster::Deep(crate::depth::to_deep(&start)),
+            },
+        ] {
+            let (mut eight, mut deep) = (start.clone(), crate::depth::to_deep(&start));
+            for (x, y) in [(10.0, 10.0), (18.0, 14.0)] {
+                Stroke::new().to(&mut eight, x, y, 1.0, &brush, &tool, None);
+                Stroke::new().to(&mut deep, x, y, 1.0, &brush, &tool, None);
+            }
+            assert!(close(&eight, &deep), "{tool:?}");
+        }
+        let (mut eight, mut deep) = (start.clone(), crate::depth::to_deep(&start));
+        fill(&mut eight, 3, 3, RED, 40, true, None, 0.6, Blend::Multiply);
+        fill(&mut deep, 3, 3, RED, 40, true, None, 0.6, Blend::Multiply);
+        assert!(close(&eight, &deep));
+    }
+
+    #[test]
+    fn deep_gradient_reaches_its_end_colours() {
+        let mut gradient = Gradient::two([0, 0, 0, 255], [255, 128, 0, 255]);
+        gradient.start = (0.5, 0.0);
+        gradient.end = (99.5, 0.0);
+        let (mut eight, mut deep) = (RgbaImage::new(100, 1), crate::DeepImage::new(100, 1));
+        gradient.draw(&mut eight, None);
+        gradient.draw(&mut deep, None);
+        assert_eq!(deep.get_pixel(99, 0).0, [1.0, 128.0 / 255.0, 0.0, 1.0]);
+        assert_eq!(deep.get_pixel(0, 0).0, [0.0, 0.0, 0.0, 1.0]);
+        gradient.dither = false;
+        gradient.draw(&mut eight, None);
+        assert!(close(&eight, &deep));
+        let mut bright = crate::DeepImage::from_pixel(4, 4, Rgba([3.0, 3.0, 3.0, 1.0]));
+        draw_shape(
+            &mut bright,
+            &Shape::Ellipse,
+            (0.0, 0.0),
+            (2.0, 2.0),
+            Some(RED),
+            None,
+        );
+        assert_eq!(
+            bright.get_pixel(3, 3)[0],
+            3.0,
+            "bright pixels outside stay bright"
+        );
     }
 }

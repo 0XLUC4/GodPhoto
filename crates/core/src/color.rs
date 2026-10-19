@@ -1,8 +1,10 @@
 //! Colour management: ICC profiles, conversions between them, CMYK and Lab, soft proofing,
 //! gamut warning, palettes, black and white, and document colour modes.
 //!
-//! Pixels stay straight RGBA 8-bit in the document's RGB profile (`Document::profile`,
-//! `None` = sRGB); CMYK and Lab exist only on the way to and from files and in proofs.
+//! Pixels stay straight RGBA, at any depth ([`Image<S>`]), in the document's RGB profile
+//! (`Document::profile`, `None` = sRGB); CMYK and Lab exist only on the way to and from files
+//! and in proofs. Profile conversions run in floating point on deep pixels; what ends on an
+//! 8-bit screen or in 8-bit inks (display, proofs, CMYK, palettes) reads their 8-bit view.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +16,9 @@ use moxcms::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{ColorMode, Content, Document, Error, GrayImage, Result, RgbaImage, adjust};
+use crate::adjust::{self, eight_mut, eight_ref, eight_view};
+use crate::depth::{Image, Sample};
+use crate::{ColorMode, Content, Document, Error, GrayImage, Result, RgbaImage};
 
 /// How colours outside the destination's gamut are brought in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,25 +273,24 @@ fn run<T: Copy + Default + Send + Sync>(
         .for_each(|(src, dst)| drop(transform.transform(src, dst)));
 }
 
-/// Pixels of `image` laid out for `profile`: RGBA, or gray+alpha (from red) for a gray profile.
-fn pack(image: &RgbaImage, profile: &Profile) -> Vec<u8> {
+/// RGBA values laid out for `profile`: RGBA, or gray+alpha (from red) for a gray profile.
+fn pack<T: Copy>(rgba: &[T], profile: &Profile) -> Vec<T> {
     if profile.is_gray() {
-        image.pixels().flat_map(|p| [p[0], p[3]]).collect()
+        rgba.chunks_exact(4).flat_map(|p| [p[0], p[3]]).collect()
     } else {
-        image.as_raw().clone()
+        rgba.to_vec()
     }
 }
 
-/// Back to RGBA from what [`pack`] laid out.
-fn unpack(data: Vec<u8>, width: u32, height: u32, profile: &Profile) -> RgbaImage {
-    let raw = if profile.is_gray() {
+/// Back to RGBA values from what [`pack`] laid out.
+fn unpack<T: Copy>(data: Vec<T>, profile: &Profile) -> Vec<T> {
+    if profile.is_gray() {
         data.chunks_exact(2)
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect()
     } else {
         data
-    };
-    RgbaImage::from_raw(width, height, raw).unwrap_or_else(|| RgbaImage::new(width, height))
+    }
 }
 
 /// `image` (in `from`) seen through `to`, alpha kept. `None` for CMYK or when no transform exists.
@@ -301,20 +304,79 @@ fn transform_image(
         return None;
     }
     let executor = transform(from, from.layout(true), to, to.layout(true), intent)?;
-    let src = pack(image, from);
+    let src = pack(image.as_raw(), from);
     let (src_channels, dst_channels) = (channels(from) + 1, channels(to) + 1);
     let mut dst = vec![0; src.len() / src_channels * dst_channels];
     run(&*executor, &src, src_channels, &mut dst, dst_channels);
-    Some(unpack(dst, image.width(), image.height(), to))
+    let (width, height) = image.dimensions();
+    Some(
+        RgbaImage::from_raw(width, height, unpack(dst, to))
+            .unwrap_or_else(|| RgbaImage::new(width, height)),
+    )
 }
 
 /// RGB pixels from one RGB (or gray) profile to another, alpha kept. Left unchanged when either
 /// profile is CMYK. Black point compensation: the black of `from` is stretched to pure black
 /// (matrix profiles already map black to black, so it matters only for table-based ones).
-pub fn convert(image: &mut RgbaImage, from: &Profile, to: &Profile, intent: Intent, bpc: bool) {
+/// Deep pixels are converted in floating point.
+pub fn convert<S: Sample>(
+    image: &mut Image<S>,
+    from: &Profile,
+    to: &Profile,
+    intent: Intent,
+    bpc: bool,
+) {
     if from.same(to) {
         return;
     }
+    match eight_mut(image) {
+        Some(image) => convert_eight(image, from, to, intent, bpc),
+        None => convert_deep(image, from, to, intent, bpc),
+    }
+}
+
+fn convert_deep<S: Sample>(
+    image: &mut Image<S>,
+    from: &Profile,
+    to: &Profile,
+    intent: Intent,
+    bpc: bool,
+) {
+    if from.is_cmyk() || to.is_cmyk() {
+        return;
+    }
+    let Ok(executor) =
+        from.cms
+            .create_transform_f32(from.layout(true), &to.cms, to.layout(true), options(intent))
+    else {
+        return;
+    };
+    let (src_channels, dst_channels) = (channels(from) + 1, channels(to) + 1);
+    let through = |rgba: &[f32]| {
+        let src = pack(rgba, from);
+        let mut dst = vec![0f32; src.len() / src_channels * dst_channels];
+        run(&*executor, &src, src_channels, &mut dst, dst_channels);
+        unpack(dst, to)
+    };
+    let values: Vec<f32> = image.iter().map(|v| v.unit()).collect();
+    let mut out = through(&values);
+    if bpc {
+        let black = through(&[0.0, 0.0, 0.0, 1.0]);
+        if black[..3].iter().any(|&v| v > 0.5 / 255.0 && v < 1.0) {
+            for pixel in out.chunks_exact_mut(4) {
+                for channel in 0..3 {
+                    let b = black[channel];
+                    pixel[channel] = (pixel[channel] - b).max(0.0) / (1.0 - b);
+                }
+            }
+        }
+    }
+    for (v, new) in image.iter_mut().zip(out) {
+        *v = S::from_unit(new);
+    }
+}
+
+fn convert_eight(image: &mut RgbaImage, from: &Profile, to: &Profile, intent: Intent, bpc: bool) {
     let Some(mut out) = transform_image(image, from, to, intent) else {
         return;
     };
@@ -335,8 +397,20 @@ pub fn convert(image: &mut RgbaImage, from: &Profile, to: &Profile, intent: Inte
     *image = out;
 }
 
-/// Show `image` (in `profile`) on an sRGB screen. A plain copy when `profile` is sRGB.
-pub fn to_display(image: &RgbaImage, profile: &Profile) -> RgbaImage {
+/// Show `image` (in `profile`, any depth) on an sRGB screen, at 8 bits. A plain copy when
+/// `profile` is sRGB.
+pub fn to_display<S: Sample>(image: &Image<S>, profile: &Profile) -> RgbaImage {
+    let Some(image) = eight_ref(image) else {
+        let mut deep = image.clone();
+        convert(
+            &mut deep,
+            profile,
+            &Profile::srgb(),
+            Intent::Relative,
+            false,
+        );
+        return crate::depth::convert(&deep);
+    };
     if profile.srgb {
         return image.clone();
     }
@@ -346,12 +420,14 @@ pub fn to_display(image: &RgbaImage, profile: &Profile) -> RgbaImage {
 
 /// RGB (in `rgb`) to CMYK inks 0..=255 each (255 = full ink) through the `cmyk` profile, or by
 /// the ink model (with gray component replacement) for "Generic CMYK" or a non-CMYK `cmyk`.
-pub fn rgb_to_cmyk(
-    image: &RgbaImage,
+/// Deep pixels are read at 8 bits (the inks are 8-bit).
+pub fn rgb_to_cmyk<S: Sample>(
+    image: &Image<S>,
     rgb: &Profile,
     cmyk: &Profile,
     intent: Intent,
 ) -> Vec<[u8; 4]> {
+    let image: &RgbaImage = &eight_view(image);
     if cmyk.is_cmyk() && !cmyk.generic_cmyk {
         let src: Vec<u8> = if rgb.is_gray() {
             image.pixels().map(|p| p[0]).collect()
@@ -620,13 +696,13 @@ pub fn lab_to_rgb(lab: [f32; 3], profile: &Profile) -> [u8; 3] {
     [p[0], p[1], p[2]]
 }
 
-/// Lab of every pixel, 8-bit as in files: L*255/100, a+128, b+128.
-pub fn image_to_lab(image: &RgbaImage, profile: &Profile) -> Vec<[u8; 3]> {
+/// Lab of every pixel (any depth, read clamped to 0..1), 8-bit as in files: L*255/100, a+128,
+/// b+128.
+pub fn image_to_lab<S: Sample>(image: &Image<S>, profile: &Profile) -> Vec<[u8; 3]> {
     let n = channels(profile);
     let colors: Vec<f32> = image
-        .pixels()
-        .flat_map(|p| p.0[..n].to_vec())
-        .map(|v| v as f32 / 255.0)
+        .chunks_exact(4)
+        .flat_map(|p| p[..n].iter().map(|v| v.unit().clamp(0.0, 1.0)))
         .collect();
     let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
     colors_to_lab(&colors, profile)
@@ -674,14 +750,22 @@ fn round_trip(image: &RgbaImage, rgb: &Profile, target: &Profile, intent: Intent
 }
 
 /// Soft proof: how `image` (in `rgb`) would print or show in `target`, ready for an sRGB screen.
-pub fn proof(image: &RgbaImage, rgb: &Profile, target: &Profile, intent: Intent) -> RgbaImage {
-    to_display(&round_trip(image, rgb, target, intent), rgb)
+/// Deep pixels are proofed from their 8-bit view.
+pub fn proof<S: Sample>(
+    image: &Image<S>,
+    rgb: &Profile,
+    target: &Profile,
+    intent: Intent,
+) -> RgbaImage {
+    to_display(&round_trip(&eight_view(image), rgb, target, intent), rgb)
 }
 
 /// 255 where a pixel's colour is out of `target`'s gamut (its round trip moves it by more than
-/// a small Lab distance). Fully transparent pixels are never flagged.
-pub fn gamut_warning(image: &RgbaImage, rgb: &Profile, target: &Profile) -> GrayImage {
+/// a small Lab distance). Fully transparent pixels are never flagged. Deep pixels are checked
+/// on their 8-bit view.
+pub fn gamut_warning<S: Sample>(image: &Image<S>, rgb: &Profile, target: &Profile) -> GrayImage {
     const MAX_DELTA: f32 = 5.0;
+    let image: &RgbaImage = &eight_view(image);
     let back = round_trip(image, rgb, target, Intent::Relative);
     let (before, after) = (image_to_lab(image, rgb), image_to_lab(&back, rgb));
     let raw = before
@@ -701,7 +785,8 @@ pub fn gamut_warning(image: &RgbaImage, rgb: &Profile, target: &Profile) -> Gray
 }
 
 /// Palette of at most `colors` colours by median cut, the image mapped to it (alpha kept),
-/// with Floyd-Steinberg dithering if `dither`.
+/// with Floyd-Steinberg dithering if `dither`. 8-bit only (palettes are 8-bit); deep layers go
+/// through their 8-bit view (as [`set_mode`] does).
 pub fn quantize(image: &RgbaImage, colors: usize, dither: bool) -> (RgbaImage, Vec<[u8; 3]>) {
     let counts = histogram(image);
     let palette = median_cut(
@@ -871,6 +956,7 @@ fn diffuse(image: &RgbaImage, pick: impl Fn([u8; 3]) -> [u8; 3]) -> RgbaImage {
 }
 
 /// Black and white only (alpha kept): luma at a 50% threshold, or diffusion dither.
+/// 8-bit only; deep layers go through their 8-bit view (as [`set_mode`] does).
 pub fn to_bitmap(image: &RgbaImage, dither: bool) -> RgbaImage {
     let mut gray = image.clone();
     gray.par_chunks_mut(4).for_each(|p| {
@@ -935,13 +1021,7 @@ pub fn set_mode(doc: &mut Document, mode: ColorMode, options: &ModeOptions) {
             layer.rasterize(width, height);
         }
         match &mut layer.content {
-            Content::Pixels(image) => match mode {
-                ColorMode::Grayscale => adjust::desaturate(image),
-                ColorMode::Cmyk => *image = round_trip(image, &profile, &cmyk, options.intent),
-                ColorMode::Indexed => *image = quantize(image, options.colors, options.dither).0,
-                ColorMode::Bitmap => *image = to_bitmap(image, options.dither),
-                ColorMode::Rgb | ColorMode::Lab => {}
-            },
+            Content::Pixels(image) => mode_pixels(image, mode, options, &profile, &cmyk),
             Content::Fill(color) if mode == ColorMode::Grayscale => {
                 let mut one = RgbaImage::from_pixel(1, 1, image::Rgba(*color));
                 adjust::desaturate(&mut one);
@@ -951,6 +1031,47 @@ pub fn set_mode(doc: &mut Document, mode: ColorMode, options: &ModeOptions) {
         }
     }
     doc.mode = mode;
+}
+
+/// What [`set_mode`] does to the pixels of one layer, at any depth.
+fn mode_pixels<S: Sample>(
+    image: &mut Image<S>,
+    mode: ColorMode,
+    options: &ModeOptions,
+    profile: &Profile,
+    cmyk: &Profile,
+) {
+    match mode {
+        ColorMode::Grayscale => adjust::desaturate(image),
+        ColorMode::Cmyk => into_gamut(image, profile, cmyk, options.intent),
+        ColorMode::Indexed => through_eight(image, |eight| {
+            quantize(eight, options.colors, options.dither).0
+        }),
+        ColorMode::Bitmap => through_eight(image, |eight| to_bitmap(eight, options.dither)),
+        ColorMode::Rgb | ColorMode::Lab => {}
+    }
+}
+
+/// Bring `image` (in `rgb`) into the gamut of `target`. Deep pixels move by what the 8-bit
+/// round trip moves their 8-bit view, so their fine gradations stay (light above 1 is clipped).
+fn into_gamut<S: Sample>(image: &mut Image<S>, rgb: &Profile, target: &Profile, intent: Intent) {
+    if let Some(eight) = eight_mut(image) {
+        *eight = round_trip(eight, rgb, target, intent);
+        return;
+    }
+    let view: RgbaImage = crate::depth::convert(image);
+    let back = round_trip(&view, rgb, target, intent);
+    for ((v, before), after) in image.iter_mut().zip(view.as_raw()).zip(back.as_raw()) {
+        *v = S::from_unit(v.unit().min(1.0) + (*after as f32 - *before as f32) / 255.0);
+    }
+}
+
+/// Run an 8-bit-only operation on `image`; deep pixels take its 8-bit result.
+fn through_eight<S: Sample>(image: &mut Image<S>, operation: impl FnOnce(&RgbaImage) -> RgbaImage) {
+    match eight_mut(image) {
+        Some(eight) => *eight = operation(eight),
+        None => *image = crate::depth::convert(&operation(&crate::depth::convert(image))),
+    }
 }
 
 /// Relabel the document's colours with `profile` (`None` = sRGB) without touching pixels.
@@ -1046,6 +1167,49 @@ mod tests {
         // Embedded bytes read back as the same profile.
         let again = Profile::from_icc(&p3.icc()).expect("encoded P3");
         assert!(again.is_rgb() && !again.is_srgb());
+    }
+
+    #[test]
+    fn deep_conversions_match_eight_bits() {
+        let p3 = profile("Display P3");
+        let mut eight = sample();
+        let original = crate::depth::to_deep(&eight);
+        let mut deep = original.clone();
+        convert(&mut eight, &Profile::srgb(), &p3, Intent::Relative, false);
+        convert(&mut deep, &Profile::srgb(), &p3, Intent::Relative, false);
+        assert_ne!(deep, original);
+        for (a, b) in eight.as_raw().iter().zip(deep.as_raw()) {
+            assert!((*a as f32 - b * 255.0).abs() <= 1.5, "{a} vs {}", b * 255.0);
+        }
+        // Floating point loses nothing on the way to the screen, unlike 8 bits.
+        assert_eq!(to_display(&deep, &p3), sample());
+        assert_ne!(to_display(&eight, &p3), sample());
+        convert(&mut deep, &p3, &Profile::srgb(), Intent::Relative, false);
+        for (a, b) in deep.as_raw().iter().zip(original.as_raw()) {
+            assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        }
+        assert_eq!(to_display(&original, &Profile::srgb()), sample());
+        assert_eq!(
+            image_to_lab(&original, &Profile::srgb()),
+            image_to_lab(&sample(), &Profile::srgb())
+        );
+    }
+
+    #[test]
+    fn deep_layers_change_mode() {
+        let options = ModeOptions::default();
+        let srgb = Profile::srgb();
+        let cmyk = profile("Generic CMYK");
+        for mode in [ColorMode::Grayscale, ColorMode::Bitmap, ColorMode::Cmyk] {
+            let mut eight = sample();
+            let mut deep = crate::depth::to_deep(&eight);
+            mode_pixels(&mut eight, mode, &options, &srgb, &cmyk);
+            mode_pixels(&mut deep, mode, &options, &srgb, &cmyk);
+            let shown = crate::depth::to_rgba8(&deep);
+            for (a, b) in eight.as_raw().iter().zip(shown.as_raw()) {
+                assert!(a.abs_diff(*b) <= 1, "{mode:?}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]
