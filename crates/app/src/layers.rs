@@ -298,6 +298,10 @@ impl GodApp {
             return;
         }
         let targets = self.targets();
+        if targets.is_empty() {
+            self.toasts.error("Pick an unlocked layer to move.");
+            return;
+        }
         let tab = self.tab();
         for index in targets {
             shift_layer(&mut tab.doc.layers[index], dx, dy);
@@ -350,7 +354,7 @@ impl GodApp {
         self.open_document(name, inner, "Edit Contents");
         let child = self.tab();
         child.smart_parent = Some(parent);
-        child.synced = (child.at, child.history.len());
+        child.synced = (child.at, child.revision);
     }
 
     /// Bring what changed in the tabs editing smart objects into their parents.
@@ -358,9 +362,9 @@ impl GodApp {
         let mut updates = Vec::new();
         for tab in &mut self.tabs {
             if let Some(parent) = tab.smart_parent
-                && tab.synced != (tab.at, tab.history.len())
+                && tab.synced != (tab.at, tab.revision)
             {
-                tab.synced = (tab.at, tab.history.len());
+                tab.synced = (tab.at, tab.revision);
                 tab.dirty = false;
                 updates.push((parent, tab.doc.clone()));
             }

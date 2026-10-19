@@ -380,6 +380,62 @@ impl Text {
         (min_x, min_y, max_x - min_x, max_y - min_y)
     }
 
+    /// The text cursor before char `index`, as a line on the canvas: its two ends.
+    pub fn caret(&self, index: usize) -> Option<[(f32, f32); 2]> {
+        if self.size.is_nan() || self.size <= 0.0 {
+            return None;
+        }
+        let (font, _, _) = pick(&self.font, self.bold, self.italic)?;
+        let em = font.units_per_em().unwrap_or(1000.0);
+        let font = font.as_scaled(PxScale::from(self.size * font.height_unscaled() / em));
+        let (ascent, descent) = (font.ascent(), font.descent());
+        let ends = if self.vertical {
+            let before: String = self.text.chars().take(index).collect();
+            let column = before.matches('\n').count();
+            let row = before.rsplit('\n').next().unwrap_or("").chars().count();
+            let count = self.text.split('\n').count() as f32;
+            let column_width = self.size * self.leading;
+            let x = self.x + (count - 1.0 - column as f32) * column_width;
+            let y = self.y + row as f32 * (self.size + self.tracking);
+            [(x, y), (x + column_width, y)]
+        } else {
+            let advance = |line: &str| measure(&font, line, self.tracking);
+            let lines = wrap(&self.text, self.width.filter(|w| *w > 0.0), &advance);
+            let box_width = self.width.filter(|w| *w > 0.0).unwrap_or_else(|| {
+                lines
+                    .iter()
+                    .map(|(line, _)| advance(line))
+                    .fold(0.0, f32::max)
+            });
+            // Each line break (a newline, or the space a wrap drops) is one char.
+            let mut left = index;
+            let mut row = lines.len().saturating_sub(1);
+            for (at, (line, _)) in lines.iter().enumerate() {
+                let count = line.chars().count();
+                if left <= count {
+                    row = at;
+                    break;
+                }
+                left -= count + 1;
+            }
+            let line = lines.get(row).map_or("", |(line, _)| line.as_str());
+            let left = left.min(line.chars().count());
+            let line_width = advance(line);
+            let start = self.x
+                + match self.align {
+                    Align::Center => (box_width - line_width) / 2.0,
+                    Align::Right => box_width - line_width,
+                    // shortcut: justified lines put the caret as if left aligned.
+                    _ => 0.0,
+                };
+            let prefix: String = line.chars().take(left).collect();
+            let x = start + advance(&prefix);
+            let top = self.y + row as f32 * self.size * self.leading;
+            [(x, top), (x, top + ascent - descent)]
+        };
+        Some(ends.map(|(x, y)| self.to_canvas(x, y)))
+    }
+
     fn to_canvas(&self, x: f32, y: f32) -> (f32, f32) {
         let (sin, cos) = self.rotation.to_radians().sin_cos();
         let (dx, dy) = (x - self.x, y - self.y);
@@ -762,5 +818,20 @@ mod tests {
         text.underline = true;
         text.rotation = 30.0;
         assert!(text.render(120, 80).pixels().any(|p| p[3] > 0));
+    }
+
+    #[test]
+    fn caret_walks_the_text() {
+        if fonts().is_empty() {
+            return;
+        }
+        let text = Text::new("ab\ncd", 10.0, 20.0);
+        let [start, _] = text.caret(0).expect("caret");
+        assert!((start.0 - 10.0).abs() < 1e-3 && (start.1 - 20.0).abs() < 1e-3);
+        let [after_b, _] = text.caret(2).expect("caret");
+        assert!(after_b.0 > start.0 && (after_b.1 - start.1).abs() < 1e-3);
+        let [second_line, _] = text.caret(3).expect("caret");
+        assert!((second_line.0 - 10.0).abs() < 1e-3 && second_line.1 > start.1);
+        assert_eq!(text.caret(99), text.caret(5));
     }
 }

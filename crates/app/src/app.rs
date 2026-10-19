@@ -623,6 +623,10 @@ impl GodApp {
             self.home = true;
             self.active = 0;
         } else {
+            // The tabs after the closed one move down: the shown one stays shown.
+            if index < self.active {
+                self.active -= 1;
+            }
             self.active = self.active.min(self.tabs.len() - 1);
         }
         self.canvas = CanvasState::default();
@@ -646,6 +650,9 @@ impl GodApp {
         self.canvas.quick_mask = state.quick_mask;
         self.canvas.paint_mask = state.paint_mask;
         self.canvas.clone_source = state.clone_source;
+        self.canvas.clone_offset = state.clone_offset;
+        self.canvas.copied_at = state.copied_at;
+        self.canvas.floating = state.floating;
         if state.transform.is_some() || state.moving.is_some() {
             // An unfinished transform is applied, as when picking another tool.
             self.canvas.transform = state.transform;
@@ -669,6 +676,12 @@ impl GodApp {
         }
         if needs_tab(&cmd) && !self.has_tab() {
             return;
+        }
+        // Any command ends the typing first: it works on the layers as they are.
+        if self.has_tab()
+            && let Some(index) = self.canvas.editing_text.take()
+        {
+            self.end_text(index);
         }
         match cmd {
             Cmd::New => self.dialog = Some(Dialog::new_document(self.fg, self.bg)),
@@ -732,7 +745,10 @@ impl GodApp {
             }
             Cmd::Undo => {
                 if self.canvas.busy() {
+                    self.cancel_move();
+                    let quick_mask = self.canvas.quick_mask;
                     self.canvas = CanvasState::default();
+                    self.canvas.quick_mask = quick_mask;
                     self.tab().hidden.clear();
                     self.tab().recomposite();
                 } else if !self.tab().undo() {
@@ -1198,11 +1214,17 @@ impl GodApp {
             }
             Cmd::ApplyMask => {
                 self.canvas.paint_mask = false;
+                let (width, height) = self.tab().size();
+                let depth = self.tab().doc.depth;
                 self.edit_layer("Apply Layer Mask", |layer| {
-                    if let (Some(mask), Content::Pixels(raster)) =
-                        (layer.mask.take(), &mut layer.content)
+                    // Type, shapes and smart objects turn to pixels to take the mask.
+                    if layer.mask.is_some() && !layer.is_adjustment() && !layer.content.is_group() {
+                        layer.rasterize(width, height, depth);
+                    }
+                    if let (Content::Pixels(raster), Some(mask)) = (&mut layer.content, &layer.mask)
                     {
-                        with_raster!(raster, image => godphoto_core::apply_mask(image, &mask));
+                        with_raster!(raster, image => godphoto_core::apply_mask(image, mask));
+                        layer.mask = None;
                     }
                 });
             }
@@ -2155,15 +2177,29 @@ impl GodApp {
             (none, Key::F7, Cmd::TogglePanel(PanelKind::Layers)),
             (none, Key::F5, Cmd::FillDialog),
         ];
+        // While typing, Ctrl+A, Ctrl+Z and the like belong to the text: only file keys stay.
+        let typing = ctx.text_edit_focused() || self.canvas.editing_text.is_some();
         ctx.input_mut(|input| {
             for (modifiers, key, cmd) in table {
+                let file = matches!(
+                    cmd,
+                    Cmd::New
+                        | Cmd::Open
+                        | Cmd::Save
+                        | Cmd::SaveAs
+                        | Cmd::ExportAs
+                        | Cmd::CloseTab
+                        | Cmd::Print
+                );
+                if typing && !file {
+                    continue;
+                }
                 if input.consume_shortcut(&KeyboardShortcut::new(modifiers, key)) {
                     clicked.push(cmd);
                 }
             }
         });
         // Single keys pick tools, unless a text field has the keyboard.
-        let typing = ctx.text_edit_focused() || self.canvas.editing_text.is_some();
         if !typing && self.dialog.is_none() {
             ctx.input_mut(|input| {
                 let plain =
@@ -2174,15 +2210,16 @@ impl GodApp {
                     let Some(key) = Key::from_name(&letter.to_string()) else {
                         continue;
                     };
-                    if plain(input, key) {
-                        clicked.push(Cmd::PickTool(self.picked[group]));
-                    } else if shifted(input, key) {
+                    // Shifted first: a plain key match ignores Shift.
+                    if shifted(input, key) {
                         // Shift+key walks through the group.
                         let at = tools
                             .iter()
                             .position(|tool| *tool == self.picked[group])
                             .unwrap_or(0);
                         clicked.push(Cmd::PickTool(tools[(at + 1) % tools.len()]));
+                    } else if plain(input, key) {
+                        clicked.push(Cmd::PickTool(self.picked[group]));
                     }
                 }
                 if plain(input, Key::X) {
@@ -2210,6 +2247,9 @@ impl GodApp {
 
     fn guard_close(&mut self, ctx: &Context) {
         let requested = ctx.input(|input| input.viewport().close_requested());
+        if requested {
+            self.finish_gestures_if_tab();
+        }
         if requested && !self.quit && self.tabs.iter().any(|tab| tab.dirty) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.closing = Some(Closing::Window);
@@ -2297,6 +2337,8 @@ impl GodApp {
             self.canvas = CanvasState::default();
         }
         if let Some(index) = close {
+            // Type still being written counts as a change.
+            self.finish_gestures_if_tab();
             if self.tabs[index].dirty {
                 self.closing = Some(Closing::Tab(index));
             } else {

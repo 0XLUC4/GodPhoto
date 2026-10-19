@@ -70,6 +70,8 @@ pub struct DocTab {
     pub history: Vec<Step>,
     /// The step the document is at.
     pub at: usize,
+    /// Counts commits: with `at`, tells a changed history even once old steps are dropped.
+    pub revision: usize,
     pub view: View,
     pub composite: RgbaImage,
     /// The composite must be made again.
@@ -121,6 +123,7 @@ impl DocTab {
             last_selection: None,
             history: Vec::new(),
             at: 0,
+            revision: 0,
             view: View {
                 zoom: 1.0,
                 center: egui::Pos2::ZERO,
@@ -248,6 +251,7 @@ impl DocTab {
             self.history.remove(0);
         }
         self.at = self.history.len() - 1;
+        self.revision += 1;
         self.dirty = true;
         self.touched();
     }

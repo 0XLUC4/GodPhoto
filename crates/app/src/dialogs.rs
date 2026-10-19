@@ -556,6 +556,22 @@ impl GodApp {
                         tab.selection_changed();
                     }
                 }
+                Dialog::SmartFilter {
+                    layer,
+                    number,
+                    before,
+                    ..
+                } => {
+                    let tab = &mut self.tabs[self.active];
+                    if let Some(Content::Smart(smart)) =
+                        tab.doc.layers.get_mut(*layer).map(|l| &mut l.content)
+                        && let Some(slot) = smart.filters.get_mut(*number)
+                    {
+                        slot.filter = before.clone();
+                        smart.touch();
+                        tab.recomposite();
+                    }
+                }
                 _ => {}
             }
         }

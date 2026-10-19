@@ -202,7 +202,7 @@ impl GodApp {
         ui.add_space(4.0);
         let tab = &self.tabs[self.active];
         let tab_id = tab.id;
-        let version = (tab.at, tab.history.len());
+        let version = (tab.at, tab.revision);
         let filtering = self.thumbs.kind != 0 || !self.thumbs.search.trim().is_empty();
         let rows: Vec<usize> = (0..tab.doc.layers.len())
             .rev()
@@ -979,7 +979,7 @@ impl GodApp {
 
     fn current_histogram(&mut self) -> [[u32; 256]; 4] {
         let tab = &self.tabs[self.active];
-        let key = (tab.id, tab.at, tab.history.len());
+        let key = (tab.id, tab.at, tab.revision);
         if let Some((seen, histogram)) = &self.thumbs.histogram
             && *seen == key
         {

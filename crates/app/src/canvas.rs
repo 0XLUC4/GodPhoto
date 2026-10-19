@@ -40,10 +40,33 @@ pub struct Moving {
     pub texture: TextureHandle,
     /// The area shown by `texture`.
     pub source: Rect,
-    /// Only the selected pixels move.
-    pub selected: bool,
-    /// Fill the hole left behind from its surroundings.
-    pub content_aware: bool,
+    /// The selected pixels, off their layer while they move.
+    pub lift: Option<Lift>,
+    /// The layer's pixels before the move, put back by Escape.
+    pub before: Option<Raster>,
+}
+
+/// Selected pixels lifted off their layer: moved again, they cut no new hole and what
+/// they passed over comes back.
+#[derive(Clone)]
+pub struct Lift {
+    /// The layer without the pixels.
+    pub base: Raster,
+    /// The pixels, where they were lifted from.
+    pub piece: Raster,
+    /// The selection they were lifted with.
+    pub mask: GrayImage,
+    /// How far they are from where they were lifted.
+    pub at: (i32, i32),
+}
+
+/// The last pixels moved, kept while their layer and selection stay as the move left them.
+pub struct Floating {
+    pub tab: u64,
+    pub layer: usize,
+    /// The layer as the move left it, in the history.
+    pub step: std::sync::Arc<Layer>,
+    pub lift: Lift,
 }
 
 /// What the pointer is doing while a button is down.
@@ -181,7 +204,10 @@ pub struct CanvasState {
     pub ruler: Option<(Pos2, Pos2)>,
     pub transform: Option<Transforming>,
     pub moving: Option<Moving>,
+    pub floating: Option<Floating>,
     pub editing_text: Option<usize>,
+    /// Chars before the selection's anchor and before the text cursor, in the type edited.
+    pub caret: (usize, usize),
     pub quick_mask: bool,
     pub paint_mask: bool,
     pub clone_source: Option<Pos2>,
@@ -422,7 +448,7 @@ impl GodApp {
             };
             ui.ctx().set_cursor_icon(cursor);
         }
-        self.text_editor(ui, map);
+        self.text_editor(ui, &painter, map);
     }
 
     fn checker_texture(&mut self, ctx: &egui::Context) -> TextureHandle {
@@ -488,6 +514,12 @@ impl GodApp {
                 response.clicked(),
                 response.double_clicked(),
             );
+            // A click never reports a drag stop: it ends here.
+            if !response.drag_started() && self.canvas.drag.is_some() {
+                self.release(at, modifiers);
+                self.canvas.drag = None;
+                self.canvas.last = None;
+            }
         }
         if let (Some(at), true) = (at, response.dragged()) {
             self.drag_to(at, map, modifiers);
@@ -560,7 +592,7 @@ impl GodApp {
             }
         }
         if escape {
-            if self.canvas.transform.take().is_some() || self.canvas.moving.take().is_some() {
+            if self.canvas.transform.take().is_some() || self.cancel_move() {
                 let tab = &mut self.tabs[self.active];
                 tab.hidden.clear();
                 tab.recomposite();
@@ -1879,13 +1911,69 @@ impl GodApp {
             return None;
         }
         let selected = tab.selection.is_some() && matches!(layer.content, Content::Pixels(_));
-        let mut image = layer.render_as::<u8>(width, height)?;
-        if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
-            godphoto_core::apply_mask(&mut image, mask);
-        }
-        if selected && let Some(mask) = &tab.selection {
-            godphoto_core::apply_mask(&mut image, mask);
-        }
+        let floating = self.canvas.floating.take().filter(|floating| {
+            floating.tab == tab.id
+                && floating.layer == tab.active
+                && *floating.step == *layer
+                && tab.selection.as_ref()
+                    == Some(&shift_mask(&floating.lift.mask, floating.lift.at))
+        });
+        let mut lift = None;
+        let mut before = None;
+        let image = if selected
+            && let (Content::Pixels(raster), Some(selection)) = (&layer.content, &tab.selection)
+        {
+            // Lift the pixels off the layer: it shows the hole while they move.
+            let current = raster.clone();
+            let lifted = match floating {
+                Some(floating) => floating.lift,
+                None => {
+                    let mut base = current.clone();
+                    let piece = map_raster!(&current, image => {
+                        let mut piece = image.clone();
+                        godphoto_core::apply_mask(&mut piece, selection);
+                        piece
+                    });
+                    with_raster!(&mut base, image => {
+                        for (pixel, m) in image.pixels_mut().zip(selection.pixels()) {
+                            let kept = (255 - m[0]) as f32 / 255.0;
+                            pixel[3] = Sample::from_unit(pixel[3].unit() * kept);
+                        }
+                        if content_aware {
+                            paint::content_aware_fill(image, selection);
+                        }
+                    });
+                    Lift {
+                        base,
+                        piece,
+                        mask: selection.clone(),
+                        at: (0, 0),
+                    }
+                }
+            };
+            let shown = map_raster!(&lifted.piece, image => transform::shift(image, lifted.at.0, lifted.at.1))
+                .to_rgba8();
+            let layer = tab.layer_mut()?;
+            layer.content = Content::Pixels(lifted.base.clone());
+            let image = match layer.mask.as_ref().filter(|_| layer.mask_on) {
+                Some(mask) => {
+                    let mut image = shown;
+                    godphoto_core::apply_mask(&mut image, mask);
+                    image
+                }
+                None => shown,
+            };
+            lift = Some(lifted);
+            before = Some(current);
+            tab.recomposite();
+            image
+        } else {
+            let mut image = layer.render_as::<u8>(width, height)?;
+            if let Some(mask) = layer.mask.as_ref().filter(|_| layer.mask_on) {
+                godphoto_core::apply_mask(&mut image, mask);
+            }
+            image
+        };
         let (x, y, w, h) = transform::trim(&image, true).unwrap_or((0, 0, width, height));
         let piece = transform::crop(&image, x, y, w, h);
         let texture = ui.ctx().load_texture(
@@ -1893,7 +1981,7 @@ impl GodApp {
             ColorImage::from_rgba_unmultiplied([w as usize, h as usize], piece.as_raw()),
             TextureOptions::LINEAR,
         );
-        if !selected {
+        if lift.is_none() {
             tab.hidden = vec![tab.active];
             tab.recomposite();
         }
@@ -1902,8 +1990,8 @@ impl GodApp {
             offset: Vec2::ZERO,
             texture,
             source: Rect::from_min_size(pos2(x as f32, y as f32), vec2(w as f32, h as f32)),
-            selected,
-            content_aware,
+            lift,
+            before,
         });
         Some(Drag::Move { start: at })
     }
@@ -1987,6 +2075,19 @@ impl GodApp {
         Some(Drag::Transform { handle, last: at })
     }
 
+    /// Drop the move under way, the layer as it was; false when nothing moved.
+    pub fn cancel_move(&mut self) -> bool {
+        let Some(moving) = self.canvas.moving.take() else {
+            return false;
+        };
+        if let Some(before) = moving.before
+            && let Some(layer) = self.tabs[self.active].doc.layers.get_mut(moving.layer)
+        {
+            layer.content = Content::Pixels(before);
+        }
+        true
+    }
+
     /// Apply the transform or move under way.
     pub fn canvas_commit_transform(&mut self) {
         if let Some(moving) = self.canvas.moving.take() {
@@ -1994,44 +2095,37 @@ impl GodApp {
             tab.hidden.clear();
             tab.active = moving.layer.min(tab.doc.layers.len().saturating_sub(1));
             let (dx, dy) = (moving.offset.x as i32, moving.offset.y as i32);
+            if let Some(mut lift) = moving.lift {
+                let Some(layer) = tab.doc.layers.get_mut(moving.layer) else {
+                    return;
+                };
+                if dx == 0 && dy == 0 {
+                    // A click, no drag: the layer stays as it was.
+                    if let Some(before) = moving.before {
+                        layer.content = Content::Pixels(before);
+                    }
+                    tab.recomposite();
+                } else {
+                    lift.at = (lift.at.0 + dx, lift.at.1 + dy);
+                    layer.content = Content::Pixels(placed(&lift));
+                    tab.selection = Some(shift_mask(&lift.mask, lift.at));
+                    tab.selection_changed();
+                    tab.commit("Move");
+                }
+                let step = tab.history[tab.at].layers[moving.layer].clone();
+                self.canvas.floating = Some(Floating {
+                    tab: tab.id,
+                    layer: moving.layer,
+                    step,
+                    lift,
+                });
+                return;
+            }
             if dx == 0 && dy == 0 {
                 tab.recomposite();
                 return;
             }
-            if moving.selected {
-                let selection = tab.selection.clone();
-                let content_aware = moving.content_aware;
-                if let Some(mask) = selection {
-                    self.on_pixels_whole("Move", |raster| {
-                        with_raster!(raster, image => {
-                            let mut piece = image.clone();
-                            godphoto_core::apply_mask(&mut piece, &mask);
-                            // Take the pixels out, then put them back moved.
-                            for (pixel, m) in image.pixels_mut().zip(mask.pixels()) {
-                                let kept = (255 - m[0]) as f32 / 255.0;
-                                pixel[3] = Sample::from_unit(pixel[3].unit() * kept);
-                            }
-                            if content_aware {
-                                paint::content_aware_fill(image, &mask);
-                            }
-                            let moved = transform::shift(&piece, dx, dy);
-                            godphoto_core::blend::composite(
-                                image,
-                                &moved,
-                                godphoto_core::Blend::Normal,
-                                1.0,
-                            );
-                        })
-                    });
-                    let tab = &mut self.tabs[self.active];
-                    let moved = rgba_to_gray(&transform::shift(&gray_to_rgba(&mask), dx, dy));
-                    tab.selection = Some(moved);
-                    tab.selection_changed();
-                    tab.commit("Move Selection");
-                }
-            } else {
-                self.shift_layer(dx, dy, "Move");
-            }
+            self.shift_layer(dx, dy, "Move");
             return;
         }
         let Some(transform) = self.canvas.transform.take() else {
@@ -2093,16 +2187,6 @@ impl GodApp {
         tab.commit("Transform Again");
     }
 
-    /// Change the whole active layer (selection ignored), committing `step` after.
-    fn on_pixels_whole(&mut self, step: &str, change: impl FnOnce(&mut Raster)) {
-        let selection = self.tabs[self.active].selection.take();
-        self.on_pixels(step, |raster, _| change(raster));
-        let tab = &mut self.tabs[self.active];
-        tab.selection = selection;
-        // on_pixels committed already; the selection stays what it was.
-        let _ = tab;
-    }
-
     // ------------------------------------------------------------ type
 
     fn start_text(&mut self, at: Pos2, tool: Tool) {
@@ -2112,6 +2196,7 @@ impl GodApp {
             (0..tab.doc.layers.len())
                 .rev()
                 .find(|index| match &tab.doc.layers[*index].content {
+                    _ if !tab.doc.layers[*index].visible || tab.doc.layers[*index].locked => false,
                     Content::Text(text) => {
                         let (x, y, w, h) = text.bounds();
                         Rect::from_min_size(pos2(x, y), vec2(w, h))
@@ -2127,9 +2212,19 @@ impl GodApp {
                 self.options.bold = text.bold;
                 self.options.italic = text.italic;
                 self.options.align = text.align;
+                let click = nearest_char(text, at);
+                self.canvas.caret = (click, click);
             }
-            if let Some(editing) = self.canvas.editing_text.take() {
+            let mut index = index;
+            if let Some(editing) = self.canvas.editing_text.take()
+                && editing != index
+            {
+                let count = self.tabs[self.active].doc.layers.len();
                 self.end_text(editing);
+                // Empty type is dropped: the layers above it come down one.
+                if self.tabs[self.active].doc.layers.len() < count && editing < index {
+                    index -= 1;
+                }
             }
             self.tabs[self.active].active = index;
             self.canvas.editing_text = Some(index);
@@ -2157,6 +2252,7 @@ impl GodApp {
         tab.active = at_index;
         tab.recomposite();
         self.canvas.editing_text = Some(at_index);
+        self.canvas.caret = (0, 0);
     }
 
     /// Typing ends: name the layer after its words, drop it when empty, or make a
@@ -2170,10 +2266,32 @@ impl GodApp {
         let Content::Text(text) = &layer.content else {
             return;
         };
+        let kept = tab
+            .history
+            .get(tab.at)
+            .and_then(|step| step.layers.get(index))
+            .cloned();
         if text.text.trim().is_empty() {
             tab.doc.layers.remove(index);
             tab.active = index.saturating_sub(1);
-            tab.touched();
+            // Type that was already there is deleted for good: Undo brings it back.
+            let same = tab.history.get(tab.at).is_some_and(|step| {
+                step.layers.len() == tab.doc.layers.len()
+                    && step
+                        .layers
+                        .iter()
+                        .zip(&tab.doc.layers)
+                        .all(|(a, b)| **a == *b)
+            });
+            if same {
+                tab.touched();
+            } else {
+                tab.commit("Delete Layer");
+            }
+            return;
+        }
+        if kept.as_deref() == Some(&*layer) {
+            // Nothing typed: no step.
             return;
         }
         if layer.name == "Type Mask" {
@@ -2184,19 +2302,20 @@ impl GodApp {
             self.combine_selection(select::from_alpha(&image), "Type Mask");
             return;
         }
-        let words: String = text
-            .text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(30)
-            .collect();
-        layer.name = words;
+        let words =
+            |text: &str| -> String { text.lines().next().unwrap_or("").chars().take(30).collect() };
+        // A name given by hand stays; one made from the words follows them.
+        let named_by_words = match kept.as_deref().map(|kept| &kept.content) {
+            Some(Content::Text(old)) => layer.name == words(&old.text),
+            _ => true,
+        };
+        if layer.name == "Type" || named_by_words {
+            layer.name = words(&text.text);
+        }
         tab.commit("Type Layer");
     }
 
-    fn text_editor(&mut self, ui: &mut Ui, map: Mapping) {
+    fn text_editor(&mut self, ui: &mut Ui, painter: &egui::Painter, map: Mapping) {
         let Some(index) = self.canvas.editing_text else {
             return;
         };
@@ -2210,41 +2329,69 @@ impl GodApp {
             self.canvas.editing_text = None;
             return;
         };
+        let before = text.clone();
         // The options bar speaks for the type being edited.
         text.font = options.font.clone();
         text.size = options.font_size;
         text.bold = options.bold;
         text.italic = options.italic;
         text.align = options.align;
-        let at = map.to_screen(pos2(
-            text.x,
-            text.y + text.size * text.leading.max(1.0) + 6.0,
+        // Typing goes straight into the layer, drawn on the image as it changes.
+        let events = ui.input(|input| input.events.clone());
+        let copied = type_into(text, &mut self.canvas.caret, &events);
+        if let Some(copied) = copied {
+            ui.ctx().copy_text(copied);
+        }
+        let text = text.clone();
+        if text != before {
+            tab.recomposite();
+        }
+        let (anchor, cursor) = self.canvas.caret;
+        let screen = |(x, y): (f32, f32)| map.to_screen(pos2(x, y));
+        // The selection, char by char.
+        let highlight = Color32::from_rgba_unmultiplied(0, 120, 255, 70);
+        let chars: Vec<char> = text.text.chars().collect();
+        for at in anchor.min(cursor)..anchor.max(cursor) {
+            if chars.get(at) == Some(&'\n') {
+                continue;
+            }
+            if let (Some([a0, a1]), Some([b0, b1])) = (text.caret(at), text.caret(at + 1)) {
+                let points = vec![screen(a0), screen(b0), screen(b1), screen(a1)];
+                painter.add(Shape::convex_polygon(points, highlight, Stroke::NONE));
+            }
+        }
+        // The box of the type, and the blinking cursor.
+        let (x, y, w, h) = text.bounds();
+        let corners = [
+            pos2(x, y),
+            pos2(x + w, y),
+            pos2(x + w, y + h),
+            pos2(x, y + h),
+            pos2(x, y),
+        ]
+        .map(|p| map.to_screen(p));
+        painter.add(Shape::dashed_line(
+            &corners,
+            Stroke::new(1.0, Color32::from_rgb(0, 150, 255)),
+            4.0,
+            3.0,
         ));
-        let mut changed = false;
-        egui::Area::new(egui::Id::new(("text-edit", index)))
-            .fixed_pos(at)
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Type, then Esc or click away to finish")
-                            .weak()
-                            .size(11.0),
-                    );
-                    let edit = ui.add(
-                        egui::TextEdit::multiline(&mut text.text)
-                            .desired_rows(2)
-                            .desired_width(260.0),
-                    );
-                    if !edit.has_focus() && !edit.lost_focus() {
-                        edit.request_focus();
-                    }
-                    changed = edit.changed();
-                });
-            });
-        let snapshot = text.clone();
-        tab.recomposite();
-        let _ = (changed, snapshot);
+        let time = ui.input(|input| input.time);
+        if (time * 2.0) as i64 % 2 == 0
+            && let Some([top, bottom]) = text.caret(cursor)
+        {
+            // Dark edge, light core: seen on any colour.
+            painter.line_segment(
+                [screen(top), screen(bottom)],
+                Stroke::new(3.0, Color32::from_black_alpha(160)),
+            );
+            painter.line_segment(
+                [screen(top), screen(bottom)],
+                Stroke::new(1.0, Color32::WHITE),
+            );
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
     }
 
     // ------------------------------------------------------------ overlays
@@ -2928,6 +3075,202 @@ fn drag_transform(
             c[b] += push;
         }
     }
+}
+
+/// The char a point on the canvas falls before: the closest text cursor.
+fn nearest_char(text: &godphoto_core::Text, at: Pos2) -> usize {
+    let away = |index: usize| {
+        let Some([(x0, y0), (x1, y1)]) = text.caret(index) else {
+            return f32::MAX;
+        };
+        let (a, b) = (pos2(x0, y0), pos2(x1, y1));
+        let along = ((at - a).dot(b - a) / (b - a).length_sq().max(1e-6)).clamp(0.0, 1.0);
+        (a + (b - a) * along - at).length()
+    };
+    (0..=text.text.chars().count())
+        .min_by(|a, b| away(*a).total_cmp(&away(*b)))
+        .unwrap_or(0)
+}
+
+/// Start of the word before char `index`.
+fn word_before(chars: &[char], mut index: usize) -> usize {
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+/// End of the word after char `index`.
+fn word_after(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+/// Keys and typed chars edit `text` at `caret` (anchor, cursor). Gives what Copy or Cut
+/// took.
+fn type_into(
+    text: &mut godphoto_core::Text,
+    caret: &mut (usize, usize),
+    events: &[egui::Event],
+) -> Option<String> {
+    let mut chars: Vec<char> = text.text.chars().collect();
+    let (mut anchor, mut cursor) = (caret.0.min(chars.len()), caret.1.min(chars.len()));
+    let mut changed = false;
+    let mut copied = None;
+    for event in events {
+        let (from, to) = (anchor.min(cursor), anchor.max(cursor));
+        let put = |chars: &mut Vec<char>, typed: &str| {
+            let typed = typed.replace("\r\n", "\n").replace('\r', "\n");
+            chars.splice(from..to, typed.chars());
+            from + typed.chars().count()
+        };
+        match event {
+            egui::Event::Text(typed)
+            | egui::Event::Paste(typed)
+            | egui::Event::Ime(egui::ImeEvent::Commit(typed)) => {
+                cursor = put(&mut chars, typed);
+                anchor = cursor;
+                changed = true;
+            }
+            egui::Event::Copy | egui::Event::Cut if from < to => {
+                copied = Some(chars[from..to].iter().collect());
+                if matches!(event, egui::Event::Cut) {
+                    cursor = put(&mut chars, "");
+                    anchor = cursor;
+                    changed = true;
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                let word = modifiers.command || modifiers.alt;
+                let line_start = chars[..cursor]
+                    .iter()
+                    .rposition(|c| *c == '\n')
+                    .map_or(0, |i| i + 1);
+                let line_end = chars[cursor..]
+                    .iter()
+                    .position(|c| *c == '\n')
+                    .map_or(chars.len(), |i| cursor + i);
+                let moved = match key {
+                    Key::Enter => {
+                        cursor = put(&mut chars, "\n");
+                        anchor = cursor;
+                        changed = true;
+                        continue;
+                    }
+                    Key::Backspace | Key::Delete => {
+                        let (from, to) = match (from < to, key) {
+                            (true, _) => (from, to),
+                            (false, Key::Backspace) if word => {
+                                (word_before(&chars, cursor), cursor)
+                            }
+                            (false, Key::Backspace) => (cursor.saturating_sub(1), cursor),
+                            (false, _) if word => (cursor, word_after(&chars, cursor)),
+                            (false, _) => (cursor, (cursor + 1).min(chars.len())),
+                        };
+                        chars.drain(from..to);
+                        cursor = from;
+                        anchor = from;
+                        changed |= from < to;
+                        continue;
+                    }
+                    Key::A if modifiers.command => {
+                        anchor = 0;
+                        cursor = chars.len();
+                        continue;
+                    }
+                    Key::ArrowLeft if word => word_before(&chars, cursor),
+                    Key::ArrowLeft if from < to && !modifiers.shift => from,
+                    Key::ArrowLeft => cursor.saturating_sub(1),
+                    Key::ArrowRight if word => word_after(&chars, cursor),
+                    Key::ArrowRight if from < to && !modifiers.shift => to,
+                    Key::ArrowRight => (cursor + 1).min(chars.len()),
+                    Key::Home if modifiers.command => 0,
+                    Key::End if modifiers.command => chars.len(),
+                    Key::Home => line_start,
+                    Key::End => line_end,
+                    Key::ArrowUp | Key::ArrowDown if text.vertical => {
+                        if *key == Key::ArrowUp {
+                            cursor.saturating_sub(1)
+                        } else {
+                            (cursor + 1).min(chars.len())
+                        }
+                    }
+                    Key::ArrowUp | Key::ArrowDown => {
+                        text.text = chars.iter().collect();
+                        let Some([(x0, y0), (x1, y1)]) = text.caret(cursor) else {
+                            continue;
+                        };
+                        let (top, bottom) = (pos2(x0, y0), pos2(x1, y1));
+                        let down = (bottom - top).normalized() * text.size * text.leading;
+                        let middle = top + (bottom - top) / 2.0;
+                        let target = if *key == Key::ArrowUp {
+                            middle - down
+                        } else {
+                            middle + down
+                        };
+                        let found = nearest_char(text, target);
+                        // No line there: stay put.
+                        let same_line = text.caret(found).is_some_and(|[(x, y), _]| {
+                            (pos2(x, y) - top).dot(down.normalized()).abs() < 1.0
+                        });
+                        if same_line { cursor } else { found }
+                    }
+                    _ => continue,
+                };
+                cursor = moved;
+                if !modifiers.shift {
+                    anchor = cursor;
+                }
+            }
+            _ => {}
+        }
+    }
+    if changed {
+        text.text = chars.iter().collect();
+    }
+    *caret = (anchor, cursor);
+    copied
+}
+
+/// The selection moved by `(dx, dy)`.
+fn shift_mask(mask: &GrayImage, (dx, dy): (i32, i32)) -> GrayImage {
+    rgba_to_gray(&transform::shift(&gray_to_rgba(mask), dx, dy))
+}
+
+/// The lifted pixels put down on their layer where they are now.
+fn placed(lift: &Lift) -> Raster {
+    let mut out = lift.base.clone();
+    let (dx, dy) = lift.at;
+    match (&mut out, &lift.piece) {
+        (Raster::Eight(base), Raster::Eight(piece)) => godphoto_core::blend::composite(
+            base,
+            &transform::shift(piece, dx, dy),
+            godphoto_core::Blend::Normal,
+            1.0,
+        ),
+        (Raster::Deep(base), Raster::Deep(piece)) => godphoto_core::blend::composite(
+            base,
+            &transform::shift(piece, dx, dy),
+            godphoto_core::Blend::Normal,
+            1.0,
+        ),
+        // shortcut: depths never differ, both come from one layer raster.
+        _ => {}
+    }
+    out
 }
 
 fn polygon_contains(points: &[Pos2], p: Pos2) -> bool {
