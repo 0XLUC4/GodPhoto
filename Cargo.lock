@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "godphoto"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arboard",
  "eframe",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "godphoto-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ab_glyph",
  "flate2",
