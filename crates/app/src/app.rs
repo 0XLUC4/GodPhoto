@@ -161,6 +161,7 @@ pub enum Cmd {
     },
     FreeTransform,
     TransformAgain,
+    Warp,
     ModeDialog(godphoto_core::ColorMode),
     SetMode {
         mode: godphoto_core::ColorMode,
@@ -798,6 +799,7 @@ impl GodApp {
             }
             Cmd::FreeTransform => self.start_transform(ctx),
             Cmd::TransformAgain => self.transform_again(),
+            Cmd::Warp => self.start_warp(ctx),
             Cmd::ModeDialog(mode) => {
                 use godphoto_core::ColorMode;
                 match mode {
@@ -2094,8 +2096,7 @@ impl GodApp {
             }
         });
         // Single keys pick tools, unless a text field has the keyboard.
-        let typing =
-            ctx.memory(|memory| memory.focused().is_some()) || self.canvas.editing_text.is_some();
+        let typing = ctx.text_edit_focused() || self.canvas.editing_text.is_some();
         if !typing && self.dialog.is_none() {
             ctx.input_mut(|input| {
                 let plain =
@@ -2414,6 +2415,7 @@ impl GodApp {
                 item(ui, clicked, "Free Transform", "Ctrl+T", Cmd::FreeTransform);
                 ui.menu_button("Transform", |ui| {
                     item(ui, clicked, "Again", "Ctrl+Shift+T", Cmd::TransformAgain);
+                    item(ui, clicked, "Warp", "", Cmd::Warp);
                     ui.separator();
                     item(ui, clicked, "Rotate 180°", "", Cmd::TurnLayer(Turn::Half));
                     item(
@@ -3204,6 +3206,7 @@ impl GodApp {
             return;
         }
         let mut close = false;
+        let mut field_id = None;
         let response = egui::Modal::new(Id::new("command-palette")).show(ctx, |ui| {
             ui.set_width(460.0);
             let field = ui.add(
@@ -3213,6 +3216,7 @@ impl GodApp {
                     .desired_width(f32::INFINITY),
             );
             field.request_focus();
+            field_id = Some(field.id);
             let query = self.palette_query.to_lowercase();
             let matches: Vec<(String, Cmd)> = palette_entries()
                 .into_iter()
@@ -3237,6 +3241,10 @@ impl GodApp {
         });
         if close || response.should_close() {
             self.palette_open = false;
+            // The palette's field gives the keyboard back to the canvas.
+            if let Some(id) = field_id {
+                ctx.memory_mut(|memory| memory.surrender_focus(id));
+            }
         }
     }
 }
@@ -3538,6 +3546,7 @@ fn palette_entries() -> Vec<(String, Cmd)> {
         ("Export Artboards to Files", Cmd::ExportArtboards),
         ("Export Slices to Files", Cmd::ExportSlices),
         ("Transform Again", Cmd::TransformAgain),
+        ("Warp", Cmd::Warp),
         ("Define Brush Preset", Cmd::DefineBrush),
         ("New Group", Cmd::NewGroup),
         ("Group Layers", Cmd::GroupLayers),

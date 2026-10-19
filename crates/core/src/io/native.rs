@@ -451,6 +451,7 @@ mod tests {
             open: false,
             pass_through: false,
             artboard: None,
+            frame: false,
         });
         doc.layers.push(group);
         doc.layers.push(Layer::new("", Content::GroupEnd));

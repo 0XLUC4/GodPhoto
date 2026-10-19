@@ -68,11 +68,13 @@ pub enum Format {
     Kra,
     /// Opened only.
     Pdn,
+    /// Photos of phones and cameras (HEVC in HEIF); opened only.
+    Heic,
 }
 
 impl Format {
     /// Every format, layered ones first.
-    pub const ALL: [Format; 20] = [
+    pub const ALL: [Format; 21] = [
         Self::Native,
         Self::OpenRaster,
         Self::Psd,
@@ -81,6 +83,7 @@ impl Format {
         Self::Svg,
         Self::Png,
         Self::Jpeg,
+        Self::Heic,
         Self::Bmp,
         Self::Gif,
         Self::Tiff,
@@ -126,6 +129,7 @@ impl Format {
             Self::Svg => &["svg", "svgz"],
             Self::Kra => &["kra"],
             Self::Pdn => &["pdn"],
+            Self::Heic => &["heic", "heif", "hif"],
         }
     }
 
@@ -152,6 +156,7 @@ impl Format {
             Self::Svg => "SVG",
             Self::Kra => "Krita",
             Self::Pdn => "Paint.NET",
+            Self::Heic => "HEIC",
         }
     }
 
@@ -170,7 +175,7 @@ impl Format {
 
     /// Can be saved (ICO only up to 256 px).
     pub fn can_write(self) -> bool {
-        !matches!(self, Self::Svg | Self::Kra | Self::Pdn)
+        !matches!(self, Self::Svg | Self::Kra | Self::Pdn | Self::Heic)
     }
 
     /// Can be opened.
@@ -186,7 +191,8 @@ impl Format {
             | Self::Fits
             | Self::Svg
             | Self::Kra
-            | Self::Pdn => return None,
+            | Self::Pdn
+            | Self::Heic => return None,
             Self::Png => ImageFormat::Png,
             Self::Jpeg => ImageFormat::Jpeg,
             Self::Bmp => ImageFormat::Bmp,
@@ -252,6 +258,7 @@ pub fn open_bytes(bytes: &[u8], format: Option<Format>) -> Result<Document> {
         Format::Pdn => pdn::read(bytes),
         Format::Svg => svg::read(bytes),
         Format::Fits => fits::read(bytes),
+        Format::Heic => open_heic(bytes),
         Format::Avif => Err(Error::Format(
             "AVIF files can be saved but not opened".into(),
         )),
@@ -547,6 +554,37 @@ fn flatten_on_white(image: &RgbaImage) -> image::RgbImage {
     image::RgbImage::from_raw(image.width(), image.height(), raw).expect("3 bytes per pixel")
 }
 
+/// A HEIC photo as a one-layer document, with its colour profile.
+fn open_heic(bytes: &[u8]) -> Result<Document> {
+    let failed = |err: heic_decoder::HeifError| Error::Format(format!("HEIC: {err}"));
+    let info = heic_decoder::probe(bytes).map_err(failed)?;
+    check_size(info.width as u32, info.height as u32)?;
+    let decoded = heic_decoder::decode(bytes).map_err(failed)?;
+    let gray = decoded.chroma_format_idc == 0;
+    let icc = decoded.metadata.icc_profile.clone();
+    let rgba = decoded.to_rgba8().map_err(failed)?;
+    let (width, height) = (rgba.width as u32, rgba.height as u32);
+    check_size(width, height)?;
+    let mut image = RgbaImage::from_raw(width, height, rgba.data)
+        .ok_or_else(|| Error::Format("HEIC: the picture is cut short".into()))?;
+    if rgba.premultiplied {
+        for p in image.pixels_mut() {
+            let a = p[3] as u32;
+            if a > 0 && a < 255 {
+                for c in 0..3 {
+                    p[c] = ((p[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+    }
+    let mut doc = Document::from_image(image);
+    doc.profile = icc.filter(|icc| crate::color::Profile::from_icc(icc).is_ok_and(|p| p.is_rgb()));
+    if gray {
+        doc.mode = crate::ColorMode::Grayscale;
+    }
+    Ok(doc)
+}
+
 /// The format of a file from its first bytes.
 fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(b"8BPS") {
@@ -572,6 +610,17 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     }
     if svg::sniff(bytes) {
         return Some(Format::Svg);
+    }
+    // HEIF files start with an `ftyp` box naming an HEVC brand.
+    if bytes.get(4..8) == Some(b"ftyp")
+        && let Some(brand) = bytes.get(8..12)
+        && [
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1",
+        ]
+        .iter()
+        .any(|known| brand == *known)
+    {
+        return Some(Format::Heic);
     }
     let guessed = image::guess_format(bytes).ok()?;
     Format::ALL
@@ -852,6 +901,14 @@ mod tests {
         assert_eq!(sniff(&kra), Some(Format::Kra));
         assert_eq!(Format::from_path(Path::new("a.FITS")), Some(Format::Fits));
         assert!(!Format::Avif.can_read() && !Format::Kra.can_write());
+        assert!(Format::Heic.can_read() && !Format::Heic.can_write());
+        let mut heic = b"\0\0\0\x18ftypheic\0\0\0\0".to_vec();
+        heic.extend_from_slice(&[0; 8]);
+        assert_eq!(sniff(&heic), Some(Format::Heic));
+        assert!(
+            open_bytes(&heic, None).is_err(),
+            "a cut HEIC header is an error, not a panic"
+        );
     }
 
     #[test]

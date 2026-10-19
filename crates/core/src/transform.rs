@@ -511,7 +511,8 @@ fn bernstein(t: f32) -> [f32; 4] {
 }
 
 /// Point of the bicubic Bezier patch at (u, v); `grid` is 4x4 control points, row-major.
-fn patch_point(grid: &[(f32, f32); 16], u: f32, v: f32) -> (f32, f32) {
+/// The point at (u, v), both 0..=1, of the bicubic patch `grid` (row-major).
+pub fn patch_point(grid: &[(f32, f32); 16], u: f32, v: f32) -> (f32, f32) {
     let (bu, bv) = (bernstein(u), bernstein(v));
     let mut p = (0.0, 0.0);
     for j in 0..4 {

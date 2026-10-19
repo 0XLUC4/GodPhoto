@@ -185,6 +185,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
                     open: true,
                     pass_through: tag.attr("isolation") != Some("isolate"),
                     artboard: None,
+                    frame: false,
                 };
                 let mut layer =
                     Layer::new(tag.attr("name").unwrap_or("Group"), Content::Group(group));

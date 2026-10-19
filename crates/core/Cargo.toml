@@ -23,3 +23,5 @@ jpeg-encoder = "0.7"
 flate2 = "1"
 # SVG parsing (usvg, re-exported) and rendering.
 resvg = "0.48"
+# HEIC photos: HEIF container and its own HEVC decoder, no C code.
+heic-decoder = "0.1"

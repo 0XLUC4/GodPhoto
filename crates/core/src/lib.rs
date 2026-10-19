@@ -107,6 +107,9 @@ pub struct Group {
     pub pass_through: bool,
     /// An artboard: the group is a page of its own on the canvas.
     pub artboard: Option<Artboard>,
+    /// A frame: its mask is the frame's shape, and a picture placed in it fills it.
+    #[serde(default)]
+    pub frame: bool,
 }
 
 impl Default for Group {
@@ -115,6 +118,7 @@ impl Default for Group {
             open: true,
             pass_through: true,
             artboard: None,
+            frame: false,
         }
     }
 }

@@ -1226,6 +1226,7 @@ version = "1.0.0"
 dependencies = [
  "ab_glyph",
  "flate2",
+ "heic-decoder",
  "image",
  "jpeg-encoder",
  "moxcms",
@@ -1298,6 +1299,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
+]
+
+[[package]]
+name = "heic-decoder"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "102c786cb378778a8f44f640382f52eea3142e01e9ce22e75b515844019c1c3c"
+dependencies = [
+ "rayon",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

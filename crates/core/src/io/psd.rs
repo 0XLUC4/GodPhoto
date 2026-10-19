@@ -514,6 +514,7 @@ fn build(record: &Record, planes: &[(i16, Vec<u8>)], info: &Info) -> Result<Laye
                 open: record.section == 1,
                 pass_through: record.pass,
                 artboard: None,
+                frame: false,
             }),
         ),
         3 => Layer::new("", Content::GroupEnd),
@@ -1185,6 +1186,7 @@ mod tests {
             open: false,
             pass_through: false,
             artboard: None,
+            frame: false,
         });
         inner.opacity = 0.5;
         inner.blend = Blend::Screen;

@@ -10,6 +10,7 @@ use crate::widgets::icon;
 pub enum Tool {
     Move,
     Artboard,
+    Frame,
     Slice,
     SliceSelect,
     PathSelection,
@@ -174,6 +175,7 @@ pub const GROUPS: &[(char, &[Tool])] = &[
         ],
     ),
     ('H', &[Tool::Hand, Tool::RotateView]),
+    ('K', &[Tool::Frame]),
     ('Z', &[Tool::Zoom]),
 ];
 
@@ -182,6 +184,7 @@ impl Tool {
         match self {
             Self::Move => "Move",
             Self::Artboard => "Artboard",
+            Self::Frame => "Frame",
             Self::Slice => "Slice",
             Self::SliceSelect => "Slice Select",
             Self::PathSelection => "Path Selection",
@@ -253,6 +256,7 @@ impl Tool {
         match self {
             Self::Move => icon::ARROWS_OUT_CARDINAL,
             Self::Artboard => icon::FRAME_CORNERS,
+            Self::Frame => icon::IMAGE_SQUARE,
             Self::Slice => icon::KNIFE,
             Self::SliceSelect => icon::CURSOR_CLICK,
             Self::PathSelection => icon::NAVIGATION_ARROW,
@@ -419,6 +423,8 @@ pub struct Options {
     pub pressure_opacity: bool,
     /// Brushes defined by the user (Edit › Define Brush Preset).
     pub brushes: Vec<(String, Brush)>,
+    /// The Frame tool draws ellipses instead of rectangles.
+    pub frame_ellipse: bool,
     pub aligned: bool,
 }
 
@@ -461,6 +467,7 @@ impl Default for Options {
             pressure_size: true,
             pressure_opacity: false,
             brushes: Vec::new(),
+            frame_ellipse: false,
             aligned: true,
         }
     }
@@ -605,6 +612,24 @@ pub fn options_bar(
             tool if tool.shape() => shape_settings(ui, tool, options),
             Tool::Zoom => {
                 ui.checkbox(&mut options.zoom_out, "Zoom out (Alt)");
+            }
+            Tool::Frame => {
+                ui.selectable_value(
+                    &mut options.frame_ellipse,
+                    false,
+                    format!("{}  Rectangle", icon::RECTANGLE),
+                );
+                ui.selectable_value(
+                    &mut options.frame_ellipse,
+                    true,
+                    format!("{}  Ellipse", icon::CIRCLE),
+                );
+                ui.label(
+                    RichText::new(
+                        "Drag to draw a frame; click in a frame to place a picture in it.",
+                    )
+                    .weak(),
+                );
             }
             _ => {}
         }

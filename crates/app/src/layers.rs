@@ -725,6 +725,132 @@ impl GodApp {
     }
 }
 
+impl GodApp {
+    // ------------------------------------------------------------ frames
+
+    /// A frame over `rect`: an empty group whose mask is a rectangle or an ellipse.
+    pub fn new_frame(&mut self, rect: egui::Rect) {
+        let (width, height) = self.tab().size();
+        let (x0, y0, x1, y1) = (rect.min.x, rect.min.y, rect.max.x, rect.max.y);
+        let mask = if self.options.frame_ellipse {
+            godphoto_core::select::ellipse(width, height, x0, y0, x1, y1)
+        } else {
+            godphoto_core::select::rect(width, height, x0, y0, x1, y1)
+        };
+        let name = self.layer_name("Frame");
+        let mut header = Layer::group(name);
+        if let Content::Group(group) = &mut header.content {
+            group.frame = true;
+            group.pass_through = false;
+        }
+        header.mask = Some(mask);
+        let tab = self.tab();
+        let at = tab.doc.span(tab.active).end() + 1;
+        tab.doc.layers.insert(at, Layer::new("", Content::GroupEnd));
+        tab.doc.layers.insert(at + 1, header);
+        tab.active = at + 1;
+        tab.picked.clear();
+        tab.commit("New Frame");
+    }
+
+    /// The frame under (`at`), topmost first.
+    pub fn frame_at(&self, at: egui::Pos2) -> Option<usize> {
+        let doc = &self.tabs[self.active].doc;
+        let (x, y) = (at.x.floor(), at.y.floor());
+        if x < 0.0 || y < 0.0 || x >= doc.width as f32 || y >= doc.height as f32 {
+            return None;
+        }
+        (0..doc.layers.len()).rev().find(|i| {
+            let layer = &doc.layers[*i];
+            matches!(&layer.content, Content::Group(group) if group.frame)
+                && layer
+                    .mask
+                    .as_ref()
+                    .is_some_and(|m| m.get_pixel(x as u32, y as u32)[0] > 127)
+        })
+    }
+
+    /// Pick a picture and put it in the frame at `header`, scaled to fill it; a picture
+    /// already there is replaced.
+    pub fn place_in_frame(&mut self, header: usize) {
+        let Some(path) = platform::pick_images().into_iter().next() else {
+            return;
+        };
+        let placed = match io::open(&path) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.toasts
+                    .error(format!("Cannot place {}: {err}", path.display()));
+                return;
+            }
+        };
+        let tab = &self.tabs[self.active];
+        let Some((fx, fy, fw, fh)) = tab.doc.layers[header]
+            .mask
+            .as_ref()
+            .and_then(godphoto_core::select::bounds)
+        else {
+            return;
+        };
+        // Cover the frame, centred, as a frame does.
+        let (w, h) = (placed.width as f32, placed.height as f32);
+        let scale = (fw as f32 / w).max(fh as f32 / h);
+        let (sw, sh) = (w * scale, h * scale);
+        let x = fx as f32 + (fw as f32 - sw) / 2.0;
+        let y = fy as f32 + (fh as f32 - sh) / 2.0;
+        let mut smart = Smart::new(placed, x, y);
+        smart.corners = [(x, y), (x + sw, y), (x + sw, y + sh), (x, y + sh)];
+        smart.touch();
+        let name = path
+            .file_stem()
+            .map_or("Placed".to_owned(), |s| s.to_string_lossy().into_owned());
+        let tab = self.tab();
+        let end = tab.doc.group_end(header).unwrap_or(header);
+        // What the frame held goes: a frame shows one picture.
+        tab.doc.layers.drain(end + 1..header);
+        let header = end + 1;
+        tab.doc
+            .layers
+            .insert(header, Layer::new(name, Content::Smart(smart)));
+        tab.active = header + 1;
+        tab.picked.clear();
+        tab.commit("Place in Frame");
+    }
+
+    /// Outlines of the frames; an empty frame shows a cross.
+    pub fn draw_frames(&self, painter: &egui::Painter, map: crate::canvas::Mapping) {
+        let doc = &self.tabs[self.active].doc;
+        let color = egui::Color32::from_rgb(0, 150, 255);
+        for (index, layer) in doc.layers.iter().enumerate() {
+            let Content::Group(group) = &layer.content else {
+                continue;
+            };
+            if !group.frame {
+                continue;
+            }
+            let Some((x, y, w, h)) = layer.mask.as_ref().and_then(godphoto_core::select::bounds)
+            else {
+                continue;
+            };
+            let (x0, y0, x1, y1) = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
+            let c = [
+                egui::pos2(x0, y0),
+                egui::pos2(x1, y0),
+                egui::pos2(x1, y1),
+                egui::pos2(x0, y1),
+            ]
+            .map(|p| map.to_screen(p));
+            let stroke = egui::Stroke::new(1.0, color);
+            painter.add(egui::Shape::closed_line(c.to_vec(), stroke));
+            let empty = doc.group_end(index).is_some_and(|end| end + 1 == index);
+            if empty {
+                painter.line_segment([c[0], c[2]], stroke);
+                painter.line_segment([c[1], c[3]], stroke);
+            }
+        }
+    }
+}
+
 /// Move one layer by whole pixels, whatever it holds.
 pub fn shift_layer(layer: &mut Layer, dx: i32, dy: i32) {
     let (fx, fy) = (dx as f32, dy as f32);

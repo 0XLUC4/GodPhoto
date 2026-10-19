@@ -126,6 +126,7 @@ fn layers(
                     open: tag.attr("collapsed") != Some("1"),
                     pass_through: tag.attr("passthrough") == Some("1"),
                     artboard: None,
+                    frame: false,
                 }),
             ),
             "paintlayer" => {

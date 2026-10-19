@@ -27,6 +27,8 @@ pub struct Transforming {
     /// Where the corners of `source` go: top left, top right, bottom right, bottom left.
     pub corners: [Pos2; 4],
     pub texture: TextureHandle,
+    /// Warp: the 16 points of a bicubic patch over `source`, row by row.
+    pub warp: Option<[Pos2; 16]>,
 }
 
 /// Pixels being dragged with the Move tool.
@@ -116,6 +118,9 @@ pub enum Drag {
     ArtboardNew {
         start: Pos2,
     },
+    FrameNew {
+        start: Pos2,
+    },
     ArtboardMove {
         header: usize,
         start: Pos2,
@@ -151,6 +156,8 @@ pub enum Target {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
     Corner(usize),
+    /// A point of the warp grid.
+    Warp(usize),
     Edge(usize),
     Inside,
     Rotate,
@@ -457,13 +464,18 @@ impl GodApp {
                 input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace),
             )
         });
-        let typing = ui.ctx().memory(|memory| memory.focused().is_some());
+        let typing = ui.ctx().text_edit_focused();
         if !typing {
             self.keys(ui, keys, tool, clicked);
         }
 
+        // A drag starts where the button went down, not where the pointer is once it has
+        // moved far enough to count as a drag.
+        let origin = ui
+            .input(|input| input.pointer.press_origin())
+            .map(|p| map.to_image(p));
         if (response.drag_started() || (response.clicked() && self.canvas.drag.is_none()))
-            && let Some(at) = at
+            && let Some(at) = origin.or(at)
         {
             self.press(
                 ui,
@@ -842,6 +854,17 @@ impl GodApp {
                 }
             }
             Tool::Slice => Some(Drag::SliceNew { start: at }),
+            Tool::Frame => {
+                // A click in a frame fills it; a drag draws a new one.
+                match self.frame_at(at) {
+                    Some(header) if click => {
+                        self.place_in_frame(header);
+                        None
+                    }
+                    _ if click => None,
+                    _ => Some(Drag::FrameNew { start: at }),
+                }
+            }
             Tool::SliceSelect => {
                 let tab = &self.tabs[self.active];
                 self.canvas.slice = tab.doc.slices.iter().rposition(|slice| {
@@ -1237,6 +1260,16 @@ impl GodApp {
             }
             Drag::PathPoint { target, .. } | Drag::PathMove { target, .. } => {
                 self.path_edited(target)
+            }
+            Drag::FrameNew { start } => {
+                let mut end = self.snapped_free(at);
+                if modifiers.shift {
+                    end = square(start, end);
+                }
+                let r = rect_of(self.snapped_free(start), end);
+                if r.width() >= 4.0 && r.height() >= 4.0 {
+                    self.new_frame(r);
+                }
             }
             Drag::ArtboardNew { start } => {
                 let r = rect_of(self.snapped_free(start), self.snapped_free(at));
@@ -1890,7 +1923,22 @@ impl GodApp {
                 source.left_bottom(),
             ],
             texture,
+            warp: None,
         });
+    }
+
+    /// Edit › Transform › Warp: a grid of 16 points to bend the layers with.
+    pub fn start_warp(&mut self, ctx: &egui::Context) {
+        if self.canvas.transform.is_none() {
+            self.start_transform(ctx);
+        }
+        if let Some(transform) = &mut self.canvas.transform {
+            let s = transform.source;
+            transform.warp = Some(std::array::from_fn(|k| {
+                let (i, j) = ((k % 4) as f32 / 3.0, (k / 4) as f32 / 3.0);
+                pos2(s.min.x + i * s.width(), s.min.y + j * s.height())
+            }));
+        }
     }
 
     fn press_transform(&mut self, at: Pos2, map: Mapping) -> Option<Drag> {
@@ -1898,6 +1946,13 @@ impl GodApp {
         let c = transform.corners;
         let screen = map.to_screen(at);
         let near = |p: Pos2| (map.to_screen(p) - screen).length() < HANDLE * 1.5;
+        if let Some(grid) = &transform.warp {
+            // Warping: a point is dragged, or the whole grid.
+            let handle = (0..16)
+                .find(|k| near(grid[*k]))
+                .map_or(Handle::Inside, Handle::Warp);
+            return Some(Drag::Transform { handle, last: at });
+        }
         let handle = if let Some(index) = (0..4).find(|i| near(c[*i])) {
             Handle::Corner(index)
         } else if let Some(index) = (0..4).find(|i| near(c[*i] + (c[(*i + 1) % 4] - c[*i]) / 2.0)) {
@@ -1962,6 +2017,18 @@ impl GodApp {
         let (width, height) = tab.size();
         let c = transform.corners;
         let s = transform.source;
+        if let Some(grid) = transform.warp {
+            let grid = grid.map(|p| (p.x, p.y));
+            let tab = &mut self.tabs[self.active];
+            for index in &transform.layers {
+                if let Some(layer) = tab.doc.layers.get_mut(*index) {
+                    warp_layer(layer, s, &grid, width, height);
+                }
+            }
+            tab.active = transform.layer;
+            tab.commit("Warp");
+            return;
+        }
         if c == [
             s.left_top(),
             s.right_top(),
@@ -2231,7 +2298,50 @@ impl GodApp {
             quad(&mut mesh, corners, unit_uv(), Color32::WHITE);
             painter.add(Shape::mesh(mesh));
         }
-        if let Some(transform) = &self.canvas.transform {
+        if let Some(transform) = &self.canvas.transform
+            && let Some(grid) = &transform.warp
+        {
+            let blue = Color32::from_rgb(0, 150, 255);
+            let points = grid.map(|p| (p.x, p.y));
+            let at = |u: f32, v: f32| {
+                let (x, y) = transform::patch_point(&points, u, v);
+                map.to_screen(pos2(x, y))
+            };
+            // The picture on the patch, in small quads.
+            let mut mesh = Mesh::with_texture(transform.texture.id());
+            let n = 16;
+            for j in 0..n {
+                for i in 0..n {
+                    let (u0, u1) = (i as f32 / n as f32, (i + 1) as f32 / n as f32);
+                    let (v0, v1) = (j as f32 / n as f32, (j + 1) as f32 / n as f32);
+                    quad(
+                        &mut mesh,
+                        [at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)],
+                        [pos2(u0, v0), pos2(u1, v0), pos2(u1, v1), pos2(u0, v1)],
+                        Color32::WHITE,
+                    );
+                }
+            }
+            painter.add(Shape::mesh(mesh));
+            // Lines of the grid follow the curves.
+            for k in 0..4 {
+                let t = k as f32 / 3.0;
+                let across: Vec<Pos2> = (0..=24).map(|s| at(s as f32 / 24.0, t)).collect();
+                let down: Vec<Pos2> = (0..=24).map(|s| at(t, s as f32 / 24.0)).collect();
+                painter.add(Shape::line(across, Stroke::new(1.0, blue)));
+                painter.add(Shape::line(down, Stroke::new(1.0, blue)));
+            }
+            for point in grid {
+                let r = Rect::from_center_size(map.to_screen(*point), Vec2::splat(HANDLE));
+                painter.rect_filled(r, CornerRadius::ZERO, Color32::WHITE);
+                painter.rect_stroke(
+                    r,
+                    CornerRadius::ZERO,
+                    Stroke::new(1.0, blue),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        } else if let Some(transform) = &self.canvas.transform {
             let mut mesh = Mesh::with_texture(transform.texture.id());
             grid_mesh(&mut mesh, transform.corners.map(|p| map.to_screen(p)), 12);
             painter.add(Shape::mesh(mesh));
@@ -2445,6 +2555,7 @@ impl GodApp {
         }
         self.draw_paths(painter, map, tool);
         self.draw_boards(painter, map);
+        self.draw_frames(painter, map);
         let tab = &self.tabs[self.active];
         for (index, at) in tab.counts.iter().enumerate() {
             let s = map.to_screen(*at);
@@ -2724,9 +2835,17 @@ fn drag_transform(
     at: Pos2,
     modifiers: Modifiers,
 ) {
-    let c = &mut t.corners;
     let d = at - last;
+    if let Some(grid) = &mut t.warp {
+        match handle {
+            Handle::Warp(k) => grid[k] += d,
+            _ => grid.iter_mut().for_each(|p| *p += d),
+        }
+        return;
+    }
+    let c = &mut t.corners;
     match handle {
+        Handle::Warp(_) => {}
         Handle::Inside => {
             for corner in c.iter_mut() {
                 *corner += d;
@@ -2920,5 +3039,36 @@ fn transform_layer(layer: &mut Layer, s: Rect, c: [Pos2; 4], width: u32, height:
                 source,
             )),
         };
+    }
+}
+
+/// Bend one layer by the patch `grid` laid over the rectangle `s`. Shapes and gradients
+/// stay live; other pixels are drawn again.
+fn warp_layer(layer: &mut Layer, s: Rect, grid: &[(f32, f32); 16], width: u32, height: u32) {
+    let source = (s.min.x, s.min.y, s.width(), s.height());
+    let map = |p: (f32, f32)| {
+        let u = (p.0 - s.min.x) / s.width().max(1e-3);
+        let v = (p.1 - s.min.y) / s.height().max(1e-3);
+        transform::patch_point(grid, u, v)
+    };
+    match &mut layer.content {
+        Content::Shape(vector) => vector.transform(map),
+        Content::Gradient(gradient) => {
+            gradient.start = map(gradient.start);
+            gradient.end = map(gradient.end);
+        }
+        Content::Fill(_) | Content::Pattern { .. } | Content::Adjustment(_) => {}
+        Content::Group(_) | Content::GroupEnd => {}
+        _ => {
+            if !matches!(layer.content, Content::Pixels(_)) {
+                layer.rasterize(width, height);
+            }
+            if let Content::Pixels(image) = &mut layer.content {
+                *image = transform::warp(image, grid, source);
+            }
+        }
+    }
+    if let Some(mask) = &mut layer.mask {
+        *mask = rgba_to_gray(&transform::warp(&gray_to_rgba(mask), grid, source));
     }
 }
